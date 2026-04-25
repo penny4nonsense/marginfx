@@ -1,0 +1,105 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "marginfx"
+version = "0.1.0"
+description = "Average marginal effects and bootstrap standard errors for any machine learning model."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+keywords = [
+    "marginal effects",
+    "interpretability",
+    "explainability",
+    "machine learning",
+    "bootstrap",
+    "scikit-learn",
+    "xgboost",
+    "tensorflow",
+    "pytorch",
+    "average marginal effects",
+    "AME",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+# Core dependencies only — ML frameworks are optional
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=1.5",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+sklearn = [
+    "scikit-learn>=1.2",
+]
+xgboost = [
+    "xgboost>=1.7",
+]
+lightgbm = [
+    "lightgbm>=3.3",
+]
+tensorflow = [
+    "tensorflow>=2.12",
+]
+pytorch = [
+    "torch>=2.0",
+]
+# Install everything
+all = [
+    "scikit-learn>=1.2",
+    "xgboost>=1.7",
+    "lightgbm>=3.3",
+    "tensorflow>=2.12",
+    "torch>=2.0",
+]
+# Development dependencies
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1",
+    "jupyter>=1.0",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/marginfx"
+Repository = "https://github.com/yourusername/marginfx"
+Issues = "https://github.com/yourusername/marginfx/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["marginfx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=marginfx --cov-report=term-missing --ignore=tests/engines/test_pytorch.py --ignore=tests/engines/test_tensorflow.py --no-cov-on-fail"
+
+[tool.coverage.run]
+parallel = false
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "I"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311", "py312"]
