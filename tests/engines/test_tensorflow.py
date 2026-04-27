@@ -20,7 +20,7 @@ import pytest
 
 tf = pytest.importorskip("tensorflow")
 
-from engines.tensorflow import (
+from marginfx.engines.tensorflow import (
     get_engine,
     make_predict_fn,
     make_fit_fn,

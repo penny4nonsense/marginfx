@@ -11,11 +11,79 @@ Hierarchy:
     marginal_effects()  -> marginal effect at all observations, single feature (vector)
     ame()               -> average marginal effect, single feature (scalar)
     all_ames()          -> average marginal effect for all features (dict)
+
+Step size (h):
+    By default, all_ames() uses adaptive h computed as:
+        h_j = max(1e-4, 0.05 * std(X[:, j]))
+
+    For integer-valued features, an additional floor of 0.5 is applied:
+        h_j = max(h_j, 0.5)  if feature takes only integer values
+
+    This ensures the finite difference step is meaningful relative to each
+    feature's natural scale — critical for tree-based models (XGBoost, random
+    forests) where predictions are piecewise constant and a fixed small h may
+    never cross a split threshold. The integer floor ensures features like
+    education (1-16) and age in whole years reliably cross split boundaries.
+
+    For smooth models (logistic regression, neural nets), the true derivative
+    is recovered regardless of h as long as h is reasonably small.
+
+    To use a fixed h for all features, pass h=0.01 (or any float) to all_ames().
+    me_at_point(), marginal_effects(), and ame() always take a fixed scalar h.
 """
 
 import numpy as np
 import pandas as pd
 from typing import Callable, Optional, Union
+
+
+# ---------------------------------------------------------------------------
+# Adaptive step size
+# ---------------------------------------------------------------------------
+
+def _compute_adaptive_h(X: np.ndarray) -> np.ndarray:
+    """
+    Compute per-feature adaptive step sizes for finite differences.
+
+    Formula:
+        h_j = max(1e-4, 0.05 * std(X[:, j]))
+
+    For integer-valued features (e.g. education_num, age in whole years),
+    an additional floor of 0.5 is applied to ensure the nudge reliably
+    crosses tree split thresholds, which occur at integer boundaries:
+        h_j = max(h_j, 0.5)  if feature takes only integer values
+
+    This scales the step size to each feature's natural variation:
+        - Integer features (e.g. education 1-16):    h = max(0.05*std, 0.5)
+        - Unscaled features (e.g. age SD≈13):        h ≈ 0.685
+        - Standardized features (SD=1):              h ≈ 0.05
+        - Large-scale features (capital_gain SD≈7k): h ≈ 360
+
+    For tree-based models, h must be large enough to cross split thresholds.
+    For smooth models, the derivative is recovered accurately for any
+    reasonable h.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix of shape (n_obs, n_features).
+
+    Returns
+    -------
+    np.ndarray
+        Per-feature step sizes, shape (n_features,).
+    """
+    stds = np.std(X, axis=0)
+    h = np.maximum(1e-4, 0.05 * stds)
+
+    # For integer-valued features, ensure h >= 0.5 so finite differences
+    # reliably cross split thresholds at integer boundaries
+    for j in range(X.shape[1]):
+        unique_vals = np.unique(X[:, j])
+        if len(unique_vals) > 1 and np.all(unique_vals == unique_vals.astype(int)):
+            h[j] = max(h[j], 0.5)
+
+    return h
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +117,7 @@ def me_at_point(
         predictions of shape (n_obs,). Provided by the engine layer.
     h : float
         Step size for finite difference approximation. Default 1e-4.
+        For tree models, consider using a larger value. See _compute_adaptive_h.
     is_categorical : bool
         If True, computes a first difference (0 -> 1) instead of a derivative.
 
@@ -173,7 +242,7 @@ def all_ames(
     predict_fn: Callable,
     feature_names: Optional[list] = None,
     categorical_features: Optional[list] = None,
-    h: float = 1e-4,
+    h: Union[float, str] = 'adaptive',
 ) -> dict:
     """
     Compute average marginal effects for all features.
@@ -189,8 +258,11 @@ def all_ames(
     categorical_features : list, optional
         List of feature indices (or names) that are categorical/binary.
         These will use first differences instead of derivatives.
-    h : float
-        Step size for finite differences.
+    h : float or 'adaptive'
+        Step size for finite differences. Default 'adaptive' computes
+        h_j = max(1e-4, 0.05 * std(X[:, j])) per feature, with an
+        additional floor of 0.5 for integer-valued features.
+        Pass a float to use a fixed step size for all features.
 
     Returns
     -------
@@ -215,10 +287,16 @@ def all_ames(
         elif isinstance(cf, int):
             cat_indices.add(cf)
 
+    # Compute adaptive h per feature or use fixed scalar
+    if h == 'adaptive':
+        h_values = _compute_adaptive_h(X)
+    else:
+        h_values = np.full(n_features, float(h))
+
     results = {}
     for idx, name in enumerate(feature_names):
         is_cat = idx in cat_indices
-        results[name] = ame(X, idx, predict_fn, h, is_cat)
+        results[name] = ame(X, idx, predict_fn, h_values[idx], is_cat)
 
     return results
 

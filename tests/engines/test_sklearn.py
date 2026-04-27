@@ -16,7 +16,7 @@ import pytest
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.svm import SVC
-from engines.sklearn import get_engine, make_predict_fn, make_fit_fn
+from marginfx.engines.sklearn import get_engine, make_predict_fn, make_fit_fn
 
 
 # ---------------------------------------------------------------------------

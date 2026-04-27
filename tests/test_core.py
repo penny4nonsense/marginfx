@@ -21,7 +21,7 @@ Ground truth validation strategy:
 import numpy as np
 import pandas as pd
 import pytest
-from core import (
+from marginfx.core import (
     me_at_point,
     marginal_effects,
     ame,

@@ -18,13 +18,19 @@ The engine layer provides two callables:
         Returns predictions of shape (n_obs,). Already bound to the model
         by the engine layer — takes only X as argument.
 
-These are passed in by the engine (sklearn, tensorflow, pytorch) so that
-bootstrap.py remains fully model-agnostic.
+Step size (h):
+    Default is 'adaptive', which computes h_j = max(1e-4, 0.01 * std(X[:, j]))
+    per feature on the bootstrap sample. This ensures finite differences are
+    meaningful relative to each feature's natural scale across all model types.
+
+    Importantly, adaptive h is recomputed on each bootstrap sample — so the
+    step size naturally reflects the scale of the resampled data, which is
+    essentially identical to the original data for large n.
 """
 
 import numpy as np
-from typing import Callable, Optional, List
-from marginfx.core import all_ames, MarginfxResult
+from typing import Callable, Optional, List, Union
+from .core import all_ames, MarginfxResult
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +44,7 @@ def _bootstrap_replicate(
     fit_fn: Callable,
     feature_names: Optional[List[str]],
     categorical_features: Optional[list],
-    h: float,
+    h: Union[float, str],
     rng: np.random.Generator,
 ) -> dict:
     """
@@ -62,8 +68,9 @@ def _bootstrap_replicate(
         Feature names passed through to all_ames().
     categorical_features : list or None
         Categorical feature indices or names passed through to all_ames().
-    h : float
-        Step size for finite differences.
+    h : float or 'adaptive'
+        Step size for finite differences. Passed through to all_ames().
+        When 'adaptive', h is computed from the bootstrap sample itself.
     rng : np.random.Generator
         Random number generator for reproducibility.
 
@@ -96,6 +103,7 @@ def _bootstrap_replicate(
             return fitted(X_input)
 
     # Compute AMEs on the bootstrap sample
+    # When h='adaptive', step sizes are computed from X_boot itself
     return all_ames(
         X=X_boot,
         predict_fn=replicate_predict_fn,
@@ -119,7 +127,7 @@ def bootstrap_ames(
     categorical_features: Optional[list] = None,
     n_bootstrap: int = 200,
     alpha: float = 0.05,
-    h: float = 1e-4,
+    h: Union[float, str] = 'adaptive',
     seed: Optional[int] = None,
     verbose: bool = True,
 ) -> MarginfxResult:
@@ -158,8 +166,10 @@ def bootstrap_ames(
         Number of bootstrap replicates. Default 200.
     alpha : float
         Significance level. Default 0.05 gives 95% CIs.
-    h : float
-        Step size for finite differences.
+    h : float or 'adaptive'
+        Step size for finite differences. Default 'adaptive' computes
+        h_j = max(1e-4, 0.01 * std(X[:, j])) per feature.
+        Pass a float to use a fixed step size for all features.
     seed : int, optional
         Random seed for reproducibility.
     verbose : bool

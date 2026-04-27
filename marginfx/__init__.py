@@ -31,8 +31,8 @@ finite differences — faster and more accurate.
 import numpy as np
 from typing import Callable, List, Optional, Union
 
-from marginfx.core import MarginfxResult, all_ames
-from marginfx.bootstrap import bootstrap_ames
+from .core import MarginfxResult, all_ames
+from .bootstrap import bootstrap_ames
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +48,9 @@ def _detect_engine(model) -> str:
         2. TensorFlow — tf.keras.Model
         3. Sklearn — anything with .predict()
         4. Unknown — raise helpful error
+
+    Uses broad Exception catch for PyTorch and TensorFlow to handle
+    broken installations gracefully (e.g. DLL errors on Windows).
 
     Parameters
     ----------
@@ -77,7 +80,7 @@ def _detect_engine(model) -> str:
         import tensorflow as tf
         if isinstance(model, tf.keras.Model):
             return 'tensorflow'
-    except ImportError:
+    except Exception:
         pass
 
     # Sklearn-compatible — anything with .predict()
@@ -172,7 +175,7 @@ def fit(
     seed: Optional[int] = None,
     verbose: bool = True,
     # Finite difference options
-    h: float = 1e-4,
+    h: Union[float, str] = 'adaptive',
     # TensorFlow / PyTorch options
     n_epochs: int = 10,
     batch_size: int = 32,
@@ -216,10 +219,12 @@ def fit(
         Random seed for reproducibility.
     verbose : bool
         Print bootstrap progress. Default True.
-    h : float
-        Step size for finite difference approximation. Default 1e-4.
+    h : float or 'adaptive'
+        Step size for finite difference approximation. Default 'adaptive'
+        computes h_j = max(1e-4, 0.01 * std(X[:, j])) per feature.
+        Pass a float to use a fixed step size for all features.
         Only used for sklearn models — TensorFlow and PyTorch use exact
-        gradients.
+        gradients regardless of h.
     n_epochs : int
         Epochs for bootstrap warm-start refit. TensorFlow and PyTorch only.
         Default 10.
@@ -311,13 +316,6 @@ def fit(
         optimizer_fn=optimizer_fn,
         loss_fn=loss_fn,
     )
-
-    # Bind predict_fn for gradient-based engines
-    # gradient_ame_fn overrides finite differences in all_ames for TF/PyTorch
-    # For sklearn, gradient_ame_fn is None and finite differences are used
-    bound_predict_fn = lambda X_input: predict_fn(model, X_input) \
-        if engine_name == 'sklearn' \
-        else predict_fn(X_input)
 
     # Run bootstrap
     result = bootstrap_ames(

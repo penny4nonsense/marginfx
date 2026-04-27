@@ -12,8 +12,8 @@ Tests focus on:
 
 import numpy as np
 import pytest
-from bootstrap import bootstrap_ames
-from core import MarginfxResult
+from marginfx.bootstrap import bootstrap_ames
+from marginfx.core import MarginfxResult
 
 
 # ---------------------------------------------------------------------------

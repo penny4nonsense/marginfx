@@ -22,7 +22,7 @@ import pytest
 torch = pytest.importorskip("torch")
 import torch.nn as nn
 
-from engines.pytorch import (
+from marginfx.engines.pytorch import (
     get_engine,
     make_predict_fn,
     make_fit_fn,
