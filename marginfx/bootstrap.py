@@ -19,13 +19,18 @@ The engine layer provides two callables:
         by the engine layer — takes only X as argument.
 
 Step size (h):
-    Default is 'adaptive', which computes h_j = max(1e-4, 0.01 * std(X[:, j]))
-    per feature on the bootstrap sample. This ensures finite differences are
-    meaningful relative to each feature's natural scale across all model types.
+    Default is 'adaptive', which computes h_j = max(1e-4, 0.05 * std(X[:, j]))
+    per feature on the bootstrap sample, with an additional floor of 0.5 for
+    integer-valued features. This ensures finite differences are meaningful
+    relative to each feature's natural scale across all model types.
 
     Importantly, adaptive h is recomputed on each bootstrap sample — so the
     step size naturally reflects the scale of the resampled data, which is
     essentially identical to the original data for large n.
+
+Short-circuit:
+    Pass n_bootstrap=0 to compute point estimates only with no standard errors.
+    This is useful for simulation studies where only AME recovery is measured.
 """
 
 import numpy as np
@@ -67,7 +72,7 @@ def _bootstrap_replicate(
     feature_names : list or None
         Feature names passed through to all_ames().
     categorical_features : list or None
-        Categorical feature indices or names passed through to all_ames().
+        Categorical feature indices or names passed through to all_ames()
     h : float or 'adaptive'
         Step size for finite differences. Passed through to all_ames().
         When 'adaptive', h is computed from the bootstrap sample itself.
@@ -164,11 +169,14 @@ def bootstrap_ames(
         Indices or names of categorical/binary features.
     n_bootstrap : int
         Number of bootstrap replicates. Default 200.
+        Pass 0 to compute point estimates only with no standard errors.
+        Useful for simulation studies measuring AME recovery.
     alpha : float
         Significance level. Default 0.05 gives 95% CIs.
     h : float or 'adaptive'
         Step size for finite differences. Default 'adaptive' computes
-        h_j = max(1e-4, 0.01 * std(X[:, j])) per feature.
+        h_j = max(1e-4, 0.05 * std(X[:, j])) per feature, with an
+        additional floor of 0.5 for integer-valued features.
         Pass a float to use a fixed step size for all features.
     seed : int, optional
         Random seed for reproducibility.
@@ -178,7 +186,8 @@ def bootstrap_ames(
     Returns
     -------
     MarginfxResult
-        Contains point estimates, standard errors, and confidence intervals.
+        Contains point estimates, and optionally standard errors and
+        confidence intervals if n_bootstrap > 0.
     """
     X = np.array(X, dtype=float)
     y = np.array(y, dtype=float)
@@ -198,6 +207,17 @@ def bootstrap_ames(
         categorical_features=categorical_features,
         h=h,
     )
+
+    # --- Short-circuit if no bootstrap requested ---
+    if n_bootstrap == 0:
+        return MarginfxResult(
+            estimates=point_estimates,
+            std_errors=None,
+            conf_int=None,
+            n_obs=n_obs,
+            n_bootstrap=0,
+            alpha=alpha,
+        )
 
     # --- Bootstrap replicates ---
     # Store as dict of feature -> list of B AME estimates
