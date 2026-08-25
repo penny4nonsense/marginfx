@@ -1,46 +1,107 @@
 # marginfx
 
-**Average marginal effects and bootstrap standard errors for any machine learning model.**
+**Window average marginal effects, with valid inference, for any machine learning model.**
 
-Get OLS-style interpretability from scikit-learn, XGBoost, TensorFlow, and PyTorch. One function call. One tidy table.
+Get an OLS-style coefficient table out of scikit-learn, XGBoost, TensorFlow, or PyTorch — estimate, standard error, *t*-statistic, p-value — with standard errors that are asymptotically valid rather than heuristic.
 
 ```python
 import marginfx as mfx
+from sklearn.ensemble import RandomForestClassifier
 
-model = RandomForestClassifier().fit(X_train, y_train)
-result = mfx.fit(model, X, y, feature_names=feature_names)
+result = mfx.fit(RandomForestClassifier(), X, y, feature_names=feature_names)
 result.summary()
 ```
 
 ```
-=================================================================
-marginfx: Average Marginal Effects
-=================================================================
+========================================================================================
+marginfx: Window Average Marginal Effects
+========================================================================================
 Observations: 1000
-Bootstrap replicates: 200
+Estimator: debiased cross-fitted (K=5)
+Standard errors: influence function
 Confidence level: 95%
------------------------------------------------------------------
-        term  estimate  std_error  statistic   p_value  conf_low  conf_high
-         age     0.032      0.004      8.100     0.000     0.024      0.040
-      income     0.008      0.001      6.300     0.000     0.006      0.010
-      female    -0.012      0.003     -3.900     0.000    -0.018     -0.006
-   education     0.021      0.005      4.200     0.000     0.011      0.031
-=================================================================
+----------------------------------------------------------------------------------------
+        term  estimate         h  std_error  statistic   p_value  conf_low  conf_high  trimmed
+         age     0.032  0.685000      0.004      8.100     0.000     0.024      0.040    0.004
+      income     0.008  0.372000      0.001      6.300     0.000     0.006      0.010    0.003
+      female    -0.012       NaN      0.003     -3.900     0.000    -0.018     -0.006    0.000
+   education     0.021  0.115000      0.005      4.200     0.000     0.011      0.031    0.006
+========================================================================================
 ```
+
+> **Note:** `mfx.fit` takes an **unfitted** learner. It fits the model itself, once per cross-fitting fold. This is not a convenience — cross-fitting requires that the model never see the observations at which its own score is evaluated.
 
 ---
 
 ## What is this?
 
-In classical econometrics, OLS gives you a coefficient table — estimates, standard errors, p-values — in units that are immediately interpretable. A one-unit increase in age increases income by $X. Everyone understands that.
+In classical econometrics, OLS gives you a coefficient table in units that are immediately interpretable. Modern ML models predict better but give you no such table.
 
-Modern ML models (random forests, neural nets, gradient boosting) give you better predictions but no such table. You get a black box.
+**marginfx bridges the gap**, and — unlike SHAP or permutation importance — it comes with an asymptotic theory saying what population quantity is being estimated and how uncertain the estimate is.
 
-**marginfx bridges the gap.** It computes *average marginal effects* (AMEs) — the same quantity that OLS reports as its coefficients — for any model. A one-unit increase in age increases P(default) by 0.032 percentage points, regardless of whether the underlying model is a random forest or a neural net.
+---
 
-Standard errors come from a nonparametric bootstrap with warm-start reinitialization, making the computation practical even for expensive models. For TensorFlow and PyTorch, exact gradients replace finite differences automatically.
+## The estimand
 
-The output is a tidy DataFrame, directly inspired by the [`broom`](https://broom.tidymodels.org/) package in R and the [`marginaleffects`](https://marginaleffects.com/) package — now available for the Python ML ecosystem.
+marginfx targets the **window average marginal effect** at scale `h`:
+
+```
+θ_{j,h} = E[ w(X) · ( f(X + h·e_j) − f(X − h·e_j) ) / 2h ]
+```
+
+Two things distinguish this from "a finite-difference approximation to a derivative":
+
+**`h` is part of the target, not a numerical tolerance.** The centered difference *is* the defining operation, computed exactly. `h` is chosen and reported the way a bandwidth is; the default asks how the prediction responds to a displacement of a twentieth of a standard deviation. It appears in the output table.
+
+**No derivative need exist anywhere.** `θ_{j,h}` is well defined for any bounded prediction function, which is what lets a single estimand cover neural networks and regression trees at once. It converges to the classical AME `E[∂f/∂x_j]` as `h → 0` whenever `f` has one weak derivative.
+
+The **trimming weight** `w` gives weight zero to observations within `h_j` of the boundary of the observed support, where `x ± h·e_j` would fall outside the data and the fitted model would be silently extrapolating. The trimmed shell carries probability mass of order `h_j`; the fraction excluded is reported in the `trimmed` column.
+
+Default step size:
+
+```
+h_j = max(1e-4, 0.05 · σ̂_j)
+```
+
+For binary features the difference is replaced by the contrast `f(x | x_j=1) − f(x | x_j=0)`.
+
+---
+
+## How inference works
+
+`mfx.fit` returns a **debiased, cross-fitted** estimator. Split the sample into `K` folds; for each fold, fit the learner and a Riesz representer on the other `K−1` folds, then evaluate on the held-out fold:
+
+```
+θ̂ = (1/n) Σ_k Σ_{i∈I_k} [ w(xᵢ)·D_h f̂^(−k)(xᵢ)  +  α̂^(−k)(xᵢ)·(yᵢ − f̂^(−k)(xᵢ)) ]
+```
+
+The first term is the plug-in average. The second removes, at first order, the bias that regularization of the learner transmits to that average — each held-out residual, weighted by the representer, testifies to how the learner is locally mis-calibrated where that mis-calibration matters for the marginal effect.
+
+The representer is estimated by **Riesz regression**, minimizing
+
+```
+L(α) = (1/n) Σᵢ [ α(xᵢ)² − 2·wᵢ·( α(xᵢ + h·e_j) − α(xᵢ − h·e_j) ) / 2h ]
+```
+
+which needs only the ability to evaluate candidates at shifted points. **No density is ever estimated.** For the default polynomial sieve this loss is quadratic, so it is solved in closed form.
+
+**Standard errors require no resampling.** The summands, centered at `θ̂`, are the influence function values; the standard error is their standard deviation over `√n`. The whole table costs `K` model fits instead of the hundreds a bootstrap needs.
+
+For simultaneous bands across features, pass `n_multiplier=500` to run a multiplier bootstrap over the influence values — no additional model fits.
+
+### Double robustness
+
+The moment bias is exactly the *product* of the two nuisance errors, so an error in the learner harms the estimate only to the extent the representer is also wrong. If the representer is known in closed form — as in a simulation design with known covariate density — the bias vanishes identically and valid inference requires no consistency from the learner at all. Its failures are paid in variance, never in location.
+
+```python
+from marginfx import gaussian_window_riesz
+
+result = mfx.fit(
+    learner, X, y,
+    trim=False,                                    # Gaussian support is unbounded
+    riesz=lambda idx, h, cat: gaussian_window_riesz(idx, h),
+)
+```
 
 ---
 
@@ -50,178 +111,120 @@ The output is a tidy DataFrame, directly inspired by the [`broom`](https://broom
 pip install marginfx
 ```
 
-Install with the ML frameworks you use:
-
 ```bash
-pip install marginfx[sklearn]              # scikit-learn + XGBoost + LightGBM
-pip install marginfx[tensorflow]           # TensorFlow / Keras
-pip install marginfx[pytorch]              # PyTorch
-pip install marginfx[all]                  # everything
+pip install marginfx[sklearn]      # scikit-learn + XGBoost + LightGBM
+pip install marginfx[tensorflow]   # TensorFlow / Keras
+pip install marginfx[pytorch]      # PyTorch
+pip install marginfx[all]          # everything
 ```
+
+Core requirements are numpy, pandas and scipy only.
 
 ---
 
 ## Quick start
 
-### scikit-learn
+### scikit-learn / XGBoost / LightGBM
+
+Pass the estimator unfitted; it is cloned and refit per fold.
 
 ```python
 import marginfx as mfx
 from sklearn.ensemble import RandomForestClassifier
 
-model = RandomForestClassifier(n_estimators=100).fit(X_train, y_train)
-
 result = mfx.fit(
-    model, X, y,
+    RandomForestClassifier(n_estimators=200),
+    X, y,
     feature_names=feature_names,
-    n_bootstrap=200,
     seed=42,
 )
-
-result.summary()          # formatted table
-result.tidy()             # pandas DataFrame
-```
-
-### XGBoost
-
-```python
-import marginfx as mfx
-import xgboost as xgb
-
-model = xgb.XGBClassifier().fit(X_train, y_train)
-result = mfx.fit(model, X, y, feature_names=feature_names, seed=42)
 result.summary()
+result.tidy()
 ```
 
 ### TensorFlow / Keras
+
+Pass a **factory** — a zero-argument callable returning a fresh compiled model.
 
 ```python
 import marginfx as mfx
 import tensorflow as tf
 
-model = tf.keras.models.load_model("my_model.keras")
+def make_model():
+    m = tf.keras.Sequential([
+        tf.keras.layers.Dense(64, activation="relu"),
+        tf.keras.layers.Dense(1, activation="sigmoid"),
+    ])
+    m.compile(optimizer="adam", loss="binary_crossentropy")
+    return m
 
-result = mfx.fit(
-    model, X, y,
-    feature_names=feature_names,
-    n_epochs=10,       # bootstrap warm-start epochs
-    seed=42,
-)
-result.summary()
+result = mfx.fit(make_model, X, y, n_epochs=20, seed=42)
 ```
 
 ### PyTorch
 
 ```python
 import marginfx as mfx
-import torch.nn as nn
+import torch, torch.nn as nn
 
 result = mfx.fit(
-    model, X, y,
-    feature_names=feature_names,
+    lambda: nn.Sequential(nn.Linear(p, 64), nn.ReLU(), nn.Linear(64, 1), nn.Sigmoid()),
+    X, y,
     loss_fn=nn.BCELoss(),
-    optimizer_fn=lambda p: torch.optim.Adam(p, lr=1e-3),
-    n_epochs=10,
+    optimizer_fn=lambda prm: torch.optim.Adam(prm, lr=1e-3),
+    n_epochs=20,
     seed=42,
 )
-result.summary()
-```
-
-### Pandas DataFrames
-
-```python
-# Column names are picked up automatically
-result = mfx.fit(model, df[features], df["target"])
-result.tidy()
 ```
 
 ### Categorical features
 
+Binary features use the contrast with an inverse propensity representer.
+
 ```python
-# Categorical features use first differences (0 -> 1) instead of derivatives
 result = mfx.fit(
     model, X, y,
-    feature_names=feature_names,
     categorical_features=["female", "married", "has_degree"],
 )
+```
+
+### Pandas
+
+```python
+result = mfx.fit(model, df[features], df["target"])   # column names picked up
 ```
 
 ---
 
 ## The tidy output
 
-`result.tidy()` returns a pandas DataFrame modeled on `broom::tidy()` in R:
-
-| term | estimate | std_error | statistic | p_value | conf_low | conf_high |
-|------|----------|-----------|-----------|---------|----------|-----------|
-| age | 0.032 | 0.004 | 8.10 | 0.000 | 0.024 | 0.040 |
-| income | 0.008 | 0.001 | 6.30 | 0.000 | 0.006 | 0.010 |
-| female | -0.012 | 0.003 | -3.90 | 0.000 | -0.018 | -0.006 |
-
-- **estimate** — the average marginal effect (AME): mean of pointwise dy/dx across all observations
-- **std_error** — bootstrap standard deviation across replicates
-- **statistic** — estimate / std_error (normal approximation)
-- **p_value** — two-tailed p-value under normal approximation
-- **conf_low / conf_high** — percentile bootstrap confidence interval
+| column | meaning |
+|--------|---------|
+| `term` | feature name |
+| `estimate` | window AME `θ̂_{j,h}` |
+| `h` | step size defining the estimand (`NaN` for categoricals) |
+| `std_error` | influence-function standard error |
+| `statistic` | `estimate / std_error` |
+| `p_value` | two-tailed, asymptotic normal |
+| `conf_low` / `conf_high` | pointwise confidence interval |
+| `simul_low` / `simul_high` | simultaneous band (with `n_multiplier > 0`) |
+| `trimmed` | fraction of observations given trimming weight zero |
 
 ---
 
-## How it works
+## The bootstrap is a diagnostic, not inference
 
-### Average marginal effects
+`mfx.bootstrap_diagnostic` retains the older refitting bootstrap. It measures how sensitive the reported effects are to resampling, refitting and hyperparameter selection — large dispersion is a useful warning that the fitted model is unstable.
 
-For a continuous feature *x_j*, the marginal effect at observation *i* is:
+**It is not a valid standard error**, for two reasons:
 
+1. It recenters at the fitted model, so it is blind to the regularization bias the correction term removes. Every replicate recenters at a similarly regularized fit. In the paper's simulations this drives random-forest coverage down to roughly 0.10 at n = 5,000 — the interval ends up about as wide as the bias itself. This is not specific to forests, but to any learner whose L² bias shrinks more slowly than its intervals.
+2. Because each replicate is evaluated at the original sample, it omits the variance from averaging a heterogeneous effect over a finite sample of covariate values.
+
+```python
+model = RandomForestClassifier().fit(X, y)          # note: already fitted
+diag = mfx.bootstrap_diagnostic(model, X, y, n_bootstrap=200)
 ```
-ME_i(x_j) = ∂f(x_i) / ∂x_j
-```
-
-Approximated via central finite differences:
-
-```
-ME_i(x_j) ≈ [f(x_i + h·e_j) - f(x_i - h·e_j)] / 2h
-```
-
-The AME is the mean across all observations:
-
-```
-AME(x_j) = (1/n) Σ ME_i(x_j)
-```
-
-For binary/categorical features, a first difference replaces the derivative:
-
-```
-ME_i(x_j) = f(x_i | x_j=1) - f(x_i | x_j=0)
-```
-
-For TensorFlow and PyTorch models, `tf.GradientTape` and `torch.autograd` provide exact gradients, replacing finite differences automatically.
-
-### Bootstrap standard errors
-
-Standard errors come from a nonparametric bootstrap:
-
-1. Resample the data with replacement
-2. Refit the model warm-starting from the original (faster convergence)
-3. Compute AMEs on the bootstrap sample
-4. Repeat B times
-5. SE = standard deviation of the B AME estimates
-6. CI = percentile interval of the B AME estimates
-
-Warm-starting from the original model makes the bootstrap practical for expensive models — bootstrap replicates converge in far fewer iterations than cold retraining.
-
----
-
-## Supported models
-
-| Framework | Models | Gradient method | Warm-start |
-|-----------|--------|-----------------|------------|
-| scikit-learn | RandomForest, GradientBoosting, LogisticRegression, LinearRegression, SVC, and all sklearn-compatible models | Finite differences | Yes (where supported) |
-| XGBoost | XGBClassifier, XGBRegressor | Finite differences | Yes (native) |
-| LightGBM | LGBMClassifier, LGBMRegressor | Finite differences | Yes (native) |
-| TensorFlow | tf.keras.Model | Exact (GradientTape) | Yes (continued training) |
-| PyTorch | torch.nn.Module | Exact (autograd) | Yes (continued training) |
-
-Model type is detected automatically. No need to specify the engine.
 
 ---
 
@@ -231,50 +234,51 @@ Model type is detected automatically. No need to specify the engine.
 
 ```python
 mfx.fit(
-    model,                        # fitted model — any supported type
-    X,                            # feature matrix (numpy array or pandas DataFrame)
-    y,                            # target vector
-    feature_names=None,           # list of feature names (auto from DataFrame columns)
-    categorical_features=None,    # list of categorical feature indices or names
-    n_bootstrap=200,              # number of bootstrap replicates
-    alpha=0.05,                   # significance level (0.05 = 95% CI)
-    seed=None,                    # random seed for reproducibility
-    verbose=True,                 # print bootstrap progress
-    h=1e-4,                       # finite difference step size (sklearn models)
-    n_epochs=10,                  # bootstrap refit epochs (TF/PyTorch)
-    batch_size=32,                # bootstrap refit batch size (TF/PyTorch)
-    optimizer_fn=None,            # optimizer callable (PyTorch only)
-    loss_fn=None,                 # loss function (PyTorch only)
+    learner,                      # UNFITTED estimator, or zero-arg factory callable
+    X, y,
+    feature_names=None,
+    categorical_features=None,
+    h='adaptive',                 # 'adaptive', a float, or a per-feature array
+    trim=True,                    # apply the trimming weight
+    n_folds=5,                    # cross-fitting folds K
+    riesz=None,                   # None estimates it; or dict / factory for known α
+    sieve_degree=2,               # polynomial degree for the default sieve
+    sieve_ridge=1e-6,
+    alpha_bound=None,             # truncation bound for the representer
+    alpha=0.05,
+    n_multiplier=0,               # multiplier bootstrap draws for simultaneous bands
+    seed=None,
+    verbose=True,
+    n_epochs=10, batch_size=32,   # Keras / PyTorch
+    optimizer_fn=None, loss_fn=None,
 )
 ```
-
-Returns a `MarginfxResult` object.
 
 ### `MarginfxResult`
 
 ```python
-result.tidy()        # pandas DataFrame with estimates, SEs, CIs
-result.summary()     # formatted summary table printed to stdout
-result.estimates     # dict of feature -> AME estimate
-result.std_errors    # dict of feature -> bootstrap SE
-result.conf_int      # dict of feature -> (conf_low, conf_high)
-result.n_obs         # number of observations
-result.n_bootstrap   # number of bootstrap replicates
+result.tidy()                     # pandas DataFrame
+result.summary()                  # formatted table
+result.estimates                  # feature -> θ̂
+result.std_errors                 # feature -> SE
+result.conf_int                   # feature -> (low, high)
+result.simultaneous_conf_int      # feature -> (low, high), if n_multiplier > 0
+result.h                          # feature -> step size used
+result.trimmed_fraction           # feature -> fraction trimmed
+result.influence                  # feature -> per-observation influence values
+result.method                     # 'debiased' | 'bootstrap-diagnostic'
+result.n_folds, result.n_obs
 ```
 
 ---
 
 ## Citation
 
-If you use marginfx in published research, please cite:
-
 ```bibtex
-@inproceedings{marginfx2026,
-  title     = {marginfx: Average Marginal Effects for Any Machine Learning Model},
-  author    = {Your Name},
-  booktitle = {Proceedings of the 26th IEEE International Conference on Data Mining (ICDM)},
-  year      = {2026},
-  address   = {Shenyang, China},
+@article{marginfx2026,
+  title  = {Model-Agnostic Average Marginal Effects with Valid Inference},
+  author = {Parker, Jason},
+  year   = {2026},
 }
 ```
 

@@ -1,407 +1,224 @@
 """
 tests/test_bootstrap.py
 -----------------------
-Unit tests for bootstrap.py.
+Unit tests for bootstrap.py -- the refitting bootstrap, retained as a
+diagnostic only.
 
-Tests focus on:
-    - Correct output structure (MarginfxResult populated correctly)
-    - Reproducibility via seed
-    - CI coverage on known DGP
-    - Bootstrap distribution properties
+The behavioural contracts that matter here are the ones the paper pins down:
+
+- replicates are evaluated at the ORIGINAL sample D, never at D^(b), so a
+  replicate depends on the draw only through f_hat^(b);
+- h and the trimming weight come from the original sample and are held fixed,
+  since they define the estimand;
+- the result is labelled a diagnostic, so nobody mistakes the dispersion for
+  a valid standard error.
 """
 
 import numpy as np
 import pytest
-from marginfx.bootstrap import bootstrap_ames
-from marginfx.core import MarginfxResult
 
+from marginfx.bootstrap import _bootstrap_replicate, bootstrap_diagnostic
+from marginfx.core import support_bounds
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def rng():
-    return np.random.default_rng(42)
+    return np.random.default_rng(3)
 
 
 @pytest.fixture
-def linear_data(rng):
-    """
-    Known DGP: y = 2*x1 + 3*x2 + noise
-    True AMEs: x1 -> 2.0, x2 -> 3.0
-    """
-    n = 200
+def data(rng):
+    n = 400
     X = rng.standard_normal((n, 2))
-    y = 2.0 * X[:, 0] + 3.0 * X[:, 1] + rng.standard_normal(n) * 0.5
+    y = 2.0 * X[:, 0] + 3.0 * X[:, 1] + rng.standard_normal(n)
     return X, y
 
 
-@pytest.fixture
-def dummy_model():
-    """
-    A trivial model object that we can refit.
-    Stores coefficients for a linear model manually.
-    """
-    class LinearModel:
-        def __init__(self):
-            self.coef_ = np.array([2.0, 3.0])
+class DummyModel:
+    """Linear model with fixed coefficients; refits are no-ops."""
 
-        def fit(self, X, y):
-            # OLS closed form
-            self.coef_ = np.linalg.lstsq(X, y, rcond=None)[0]
-            return self
+    def __init__(self, coefs=(2.0, 3.0)):
+        self.coefs = np.asarray(coefs, dtype=float)
 
-        def predict(self, X):
-            return X @ self.coef_
-
-    model = LinearModel()
-    return model
+    def predict(self, X):
+        return np.asarray(X, dtype=float) @ self.coefs
 
 
 @pytest.fixture
-def fitted_model(dummy_model, linear_data):
-    X, y = linear_data
-    return dummy_model.fit(X, y)
+def dummy():
+    model = DummyModel()
 
-
-@pytest.fixture
-def predict_fn():
-    def _predict_fn(model, X):
+    def predict_fn(X):
         return model.predict(X)
-    return _predict_fn
 
+    def fit_fn(current, X_boot, y_boot):
+        return DummyModel(current.coefs)
 
-@pytest.fixture
-def fit_fn():
-    def _fit_fn(model, X_boot, y_boot):
-        import copy
-        new_model = copy.deepcopy(model)
-        new_model.fit(X_boot, y_boot)
-        return new_model
-    return _fit_fn
+    return model, predict_fn, fit_fn
 
 
 # ---------------------------------------------------------------------------
-# Output structure tests
+# Evaluation point
 # ---------------------------------------------------------------------------
 
-class TestBootstrapOutput:
+class TestEvaluationPoint:
 
-    def test_returns_marginfx_result(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """bootstrap_ames should return a MarginfxResult."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=20,
-            seed=42,
-            verbose=False,
-        )
-        assert isinstance(result, MarginfxResult)
-
-    def test_estimates_populated(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Result should have estimates dict populated."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=20,
-            seed=42,
-            verbose=False,
-        )
-        assert result.estimates is not None
-        assert len(result.estimates) == 2
-
-    def test_std_errors_populated(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Result should have std_errors dict populated."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=20,
-            seed=42,
-            verbose=False,
-        )
-        assert result.std_errors is not None
-        assert len(result.std_errors) == 2
-
-    def test_conf_int_populated(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Result should have conf_int dict populated."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=20,
-            seed=42,
-            verbose=False,
-        )
-        assert result.conf_int is not None
-        assert len(result.conf_int) == 2
-
-    def test_conf_int_is_tuple(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Each conf_int entry should be a (low, high) tuple."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=20,
-            seed=42,
-            verbose=False,
-        )
-        for feature, ci in result.conf_int.items():
-            assert isinstance(ci, tuple)
-            assert len(ci) == 2
-            assert ci[0] < ci[1]
-
-    def test_n_obs_correct(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Result n_obs should match input dataset size."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=20,
-            seed=42,
-            verbose=False,
-        )
-        assert result.n_obs == X.shape[0]
-
-    def test_n_bootstrap_recorded(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Result should record number of bootstrap replicates."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=25,
-            seed=42,
-            verbose=False,
-        )
-        assert result.n_bootstrap == 25
-
-
-# ---------------------------------------------------------------------------
-# Reproducibility tests
-# ---------------------------------------------------------------------------
-
-class TestReproducibility:
-
-    def _run(self, fitted_model, linear_data, predict_fn, fit_fn, seed):
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        return bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=20,
-            seed=seed,
-            verbose=False,
-        )
-
-    def test_same_seed_same_result(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Same seed should produce identical results."""
-        r1 = self._run(fitted_model, linear_data, predict_fn, fit_fn, seed=42)
-        r2 = self._run(fitted_model, linear_data, predict_fn, fit_fn, seed=42)
-        for feature in r1.estimates:
-            assert abs(r1.estimates[feature] - r2.estimates[feature]) < 1e-10
-            assert abs(r1.std_errors[feature] - r2.std_errors[feature]) < 1e-10
-
-    def test_different_seed_different_result(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Different seeds should produce different SEs."""
-        r1 = self._run(fitted_model, linear_data, predict_fn, fit_fn, seed=42)
-        r2 = self._run(fitted_model, linear_data, predict_fn, fit_fn, seed=99)
-        # SEs should differ (not guaranteed but overwhelmingly likely)
-        ses_differ = any(
-            abs(r1.std_errors[f] - r2.std_errors[f]) > 1e-10
-            for f in r1.std_errors
-        )
-        assert ses_differ
-
-
-# ---------------------------------------------------------------------------
-# Statistical validity tests
-# ---------------------------------------------------------------------------
-
-class TestStatisticalValidity:
-
-    def test_ame_estimates_close_to_truth(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
+    def test_replicate_evaluates_at_original_sample(self, data, dummy, rng):
         """
-        AME estimates should be close to true values [2.0, 3.0].
-        Uses n=200 dataset so estimates should be reasonably tight.
+        The replicate estimate must be computed at X, not at the resampled
+        X_boot. With a deterministic refit the answer is then identical to
+        the full-sample plug-in on every draw.
         """
-        X, y = linear_data
+        X, y = data
+        model, _, fit_fn = dummy
+        bounds = support_bounds(X)
+        h = np.array([0.05, 0.05])
 
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=50,
-            seed=42,
-            verbose=False,
-            feature_names=['x1', 'x2'],
-        )
-        assert abs(result.estimates['x1'] - 2.0) < 0.1
-        assert abs(result.estimates['x2'] - 3.0) < 0.1
-
-    def test_std_errors_positive(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """All standard errors should be positive."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=50,
-            seed=42,
-            verbose=False,
-        )
-        for feature, se in result.std_errors.items():
-            assert se > 0, f"SE for {feature} should be positive"
-
-    def test_ci_contains_truth(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """
-        95% CI should contain true AME values [2.0, 3.0].
-        This is a single-sample test so not a coverage test,
-        but the CI should contain truth for a well-behaved linear DGP.
-        """
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        result = bootstrap_ames(
-            model=fitted_model,
-            X=X,
-            y=y,
-            fit_fn=fit_fn,
-            predict_fn=bound_predict,
-            n_bootstrap=200,
-            seed=42,
-            verbose=False,
-            feature_names=['x1', 'x2'],
-        )
-        ci_x1 = result.conf_int['x1']
-        ci_x2 = result.conf_int['x2']
-
-        assert ci_x1[0] < 2.0 < ci_x1[1], \
-            f"CI {ci_x1} should contain true AME 2.0"
-        assert ci_x2[0] < 3.0 < ci_x2[1], \
-            f"CI {ci_x2} should contain true AME 3.0"
-
-    def test_alpha_affects_ci_width(
-        self, fitted_model, linear_data, predict_fn, fit_fn
-    ):
-        """Smaller alpha (wider CI) should produce wider intervals."""
-        X, y = linear_data
-
-        def bound_predict(X_input):
-            return predict_fn(fitted_model, X_input)
-
-        def run(alpha):
-            return bootstrap_ames(
-                model=fitted_model,
-                X=X,
-                y=y,
-                fit_fn=fit_fn,
-                predict_fn=bound_predict,
-                n_bootstrap=100,
-                alpha=alpha,
-                seed=42,
-                verbose=False,
-                feature_names=['x1', 'x2'],
+        seen = []
+        for _ in range(5):
+            out = _bootstrap_replicate(
+                model, X, y, fit_fn, ['x0', 'x1'], None,
+                h, True, bounds, rng,
             )
+            seen.append(out['x0'])
 
-        r_95 = run(alpha=0.05)
-        r_90 = run(alpha=0.10)
+        # Identical across draws: the only channel from the draw to the
+        # estimate is f_hat^(b), which here is constant.
+        assert len(set(np.round(seen, 12))) == 1
 
-        width_95 = r_95.conf_int['x1'][1] - r_95.conf_int['x1'][0]
-        width_90 = r_90.conf_int['x1'][1] - r_90.conf_int['x1'][0]
+    def test_replicate_uses_supplied_h_not_recomputed(self, data, dummy, rng):
+        X, y = data
+        model, _, fit_fn = dummy
+        bounds = support_bounds(X)
 
-        assert width_95 > width_90, "95% CI should be wider than 90% CI"
+        big_h = np.array([1.5, 1.5])
+        out = _bootstrap_replicate(
+            model, X, y, fit_fn, ['x0', 'x1'], None,
+            big_h, True, bounds, rng,
+        )
+        # A large fixed h trims heavily, shrinking the estimate well below 2.
+        assert out['x0'] < 2.0
+
+
+# ---------------------------------------------------------------------------
+# Aggregate behaviour
+# ---------------------------------------------------------------------------
+
+class TestBootstrapDiagnostic:
+
+    def test_labelled_as_diagnostic(self, data, dummy):
+        X, y = data
+        model, predict_fn, fit_fn = dummy
+        res = bootstrap_diagnostic(
+            model, X, y, fit_fn, predict_fn,
+            n_bootstrap=5, verbose=False, seed=0,
+        )
+        assert res.method == 'bootstrap-diagnostic'
+
+    def test_zero_replicates_gives_point_estimates_only(self, data, dummy):
+        X, y = data
+        model, predict_fn, fit_fn = dummy
+        res = bootstrap_diagnostic(
+            model, X, y, fit_fn, predict_fn,
+            n_bootstrap=0, verbose=False,
+        )
+        assert res.std_errors is None
+        assert res.conf_int is None
+        assert res.n_bootstrap == 0
+        assert res.estimates['x0'] == pytest.approx(2.0, abs=0.05)
+
+    def test_deterministic_refit_gives_zero_dispersion(self, data, dummy):
+        X, y = data
+        model, predict_fn, fit_fn = dummy
+        res = bootstrap_diagnostic(
+            model, X, y, fit_fn, predict_fn,
+            n_bootstrap=8, verbose=False, seed=0,
+        )
+        assert res.std_errors['x0'] == pytest.approx(0.0, abs=1e-12)
+
+    def test_reports_h_and_trimmed_fraction(self, data, dummy):
+        X, y = data
+        model, predict_fn, fit_fn = dummy
+        res = bootstrap_diagnostic(
+            model, X, y, fit_fn, predict_fn,
+            n_bootstrap=0, verbose=False, h=0.5,
+        )
+        assert res.h['x0'] == 0.5
+        assert res.trimmed_fraction['x0'] > 0.0
+
+    def test_categorical_reported_without_h(self, rng):
+        n = 300
+        X = np.column_stack([
+            rng.standard_normal(n),
+            (rng.random(n) < 0.5).astype(float),
+        ])
+        y = X[:, 0] + 2.0 * X[:, 1]
+        model = DummyModel((1.0, 2.0))
+
+        res = bootstrap_diagnostic(
+            model, X, y,
+            lambda cur, Xb, yb: DummyModel(cur.coefs),
+            model.predict,
+            feature_names=['cont', 'bin'],
+            categorical_features=['bin'],
+            n_bootstrap=0, verbose=False,
+        )
+        assert np.isnan(res.h['bin'])
+        assert res.trimmed_fraction['bin'] == 0.0
+        assert res.estimates['bin'] == pytest.approx(2.0)
+
+    def test_reproducible_with_seed(self, data):
+        X, y = data
+
+        def noisy_fit(current, X_boot, y_boot):
+            # Refit genuinely depends on the resampled data.
+            coefs = np.linalg.lstsq(X_boot, y_boot, rcond=None)[0]
+            return DummyModel(coefs)
+
+        model = DummyModel()
+        kwargs = dict(
+            fit_fn=noisy_fit, predict_fn=model.predict,
+            n_bootstrap=6, verbose=False, seed=123,
+        )
+        a = bootstrap_diagnostic(model, X, y, **kwargs)
+        b = bootstrap_diagnostic(model, X, y, **kwargs)
+        assert a.std_errors == b.std_errors
+
+    def test_dispersion_positive_when_refit_varies(self, data):
+        X, y = data
+
+        def noisy_fit(current, X_boot, y_boot):
+            coefs = np.linalg.lstsq(X_boot, y_boot, rcond=None)[0]
+            return DummyModel(coefs)
+
+        model = DummyModel()
+        res = bootstrap_diagnostic(
+            model, X, y, noisy_fit, model.predict,
+            n_bootstrap=25, verbose=False, seed=1,
+        )
+        assert res.std_errors['x0'] > 0
+        lo, hi = res.conf_int['x0']
+        assert lo < res.estimates['x0'] < hi
+
+    def test_predict_proba_models_use_probabilities(self, rng):
+        class ProbaModel:
+            def predict_proba(self, X):
+                p = 1 / (1 + np.exp(-np.asarray(X, dtype=float)[:, 0]))
+                return np.column_stack([1 - p, p])
+
+            def predict(self, X):
+                return (self.predict_proba(X)[:, 1] > 0.5).astype(float)
+
+        n = 300
+        X = rng.standard_normal((n, 2))
+        y = (rng.random(n) < 0.5).astype(float)
+        model = ProbaModel()
+
+        res = bootstrap_diagnostic(
+            model, X, y,
+            lambda cur, Xb, yb: ProbaModel(),
+            lambda Z: model.predict_proba(Z)[:, 1],
+            n_bootstrap=3, verbose=False, seed=0,
+        )
+        # Derivative of the logistic in x0 is positive and bounded by 0.25.
+        assert 0.0 < res.estimates['x0'] < 0.25

@@ -60,76 +60,6 @@ def make_predict_fn(model) -> Callable:
 
 
 # ---------------------------------------------------------------------------
-# Exact gradient computation via GradientTape
-# ---------------------------------------------------------------------------
-
-def make_gradient_ame_fn(model) -> Callable:
-    """
-    Build an AME function using exact gradients from tf.GradientTape.
-
-    Parameters
-    ----------
-    model : tf.keras.Model
-        A fitted Keras model.
-
-    Returns
-    -------
-    Callable
-        gradient_ame_fn(X, feature_idx, is_categorical, h) -> np.ndarray
-    """
-    import tensorflow as tf
-
-    def gradient_ame_fn(
-        X: np.ndarray,
-        feature_idx: int,
-        is_categorical: bool = False,
-        h: float = 1e-4,
-    ) -> np.ndarray:
-
-        if is_categorical:
-            X_0 = X.copy()
-            X_1 = X.copy()
-            X_0[:, feature_idx] = 0.0
-            X_1[:, feature_idx] = 1.0
-
-            X_0_tensor = tf.cast(tf.constant(X_0), dtype=tf.float32)
-            X_1_tensor = tf.cast(tf.constant(X_1), dtype=tf.float32)
-
-            pred_0 = _squeeze_output(model(X_0_tensor, training=False).numpy())
-            pred_1 = _squeeze_output(model(X_1_tensor, training=False).numpy())
-
-            return pred_1 - pred_0
-
-        X_tensor = tf.cast(tf.Variable(X), dtype=tf.float32)
-
-        with tf.GradientTape() as tape:
-            tape.watch(X_tensor)
-            predictions = _squeeze_output_tensor(model(X_tensor, training=False))
-
-        grads = tape.gradient(predictions, X_tensor).numpy()
-        return grads[:, feature_idx]
-
-    return gradient_ame_fn
-
-
-def _squeeze_output(predictions: np.ndarray) -> np.ndarray:
-    if predictions.ndim == 2 and predictions.shape[1] == 1:
-        return predictions.squeeze(axis=1)
-    if predictions.ndim == 2 and predictions.shape[1] == 2:
-        return predictions[:, 1]
-    return predictions
-
-
-def _squeeze_output_tensor(predictions):
-    import tensorflow as tf
-    if len(predictions.shape) == 2 and predictions.shape[1] == 1:
-        return tf.squeeze(predictions, axis=1)
-    if len(predictions.shape) == 2 and predictions.shape[1] == 2:
-        return predictions[:, 1]
-    return predictions
-
-
-# ---------------------------------------------------------------------------
 # Warm-start fit function
 # ---------------------------------------------------------------------------
 
@@ -222,9 +152,13 @@ def get_engine(
     model,
     n_epochs: int = 10,
     batch_size: int = 32,
-) -> Tuple[Callable, Callable, Optional[Callable]]:
+) -> Tuple[Callable, Callable]:
     """
-    Get predict_fn, fit_fn, and gradient_ame_fn for a TensorFlow/Keras model.
+    Get predict_fn and fit_fn for a TensorFlow/Keras model.
+
+    Used by the bootstrap diagnostic path, which warm-starts from an already
+    fitted model. Cross-fitting uses learner.Learner instead, which trains
+    each fold from scratch.
 
     Parameters
     ----------
@@ -237,11 +171,10 @@ def get_engine(
 
     Returns
     -------
-    Tuple[Callable, Callable, Callable]
-        (predict_fn, fit_fn, gradient_ame_fn)
+    Tuple[Callable, Callable]
+        (predict_fn, fit_fn)
     """
     predict_fn = make_predict_fn(model)
     fit_fn = make_fit_fn(model, n_epochs=n_epochs, batch_size=batch_size, verbose=0)
-    gradient_ame_fn = make_gradient_ame_fn(model)
 
-    return predict_fn, fit_fn, gradient_ame_fn
+    return predict_fn, fit_fn

@@ -1,32 +1,42 @@
 """
 tests/test_core.py
 ------------------
-Unit tests for core.py.
+Unit tests for core.py -- the window estimand primitives.
 
-Ground truth validation strategy:
-    Use simple known functions where true marginal effects are exact:
+Ground truth strategy
+---------------------
+For a linear f the centered difference is exact at every h:
 
-    Linear:     f(x) = 2*x1 + 3*x2
-                True AMEs: [2.0, 3.0]
+    D_h f(x) = beta_j     for all h > 0
 
-    Quadratic:  f(x) = x1^2 + x2
-                True ME at point x1: 2*x1
-                True AME depends on distribution of x1
+so the window AME of a linear model is beta_j * E[w], with the trimming weight
+the only thing separating it from the classical coefficient. That identity is
+sharp enough to test against directly.
 
-    Binary:     f(x) = sigmoid(2*x1 + 3*x2)
-                True AMEs are not closed form but finite differences
-                should be numerically accurate
+For f(x) = x1^2 the centered difference is also exact:
+
+    (f(x+h) - f(x-h)) / 2h = 2*x1
+
+since the h^2 terms cancel -- a property specific to the centered difference,
+and one of the reasons the paper prefers it over a one-sided difference.
 """
 
 import numpy as np
 import pandas as pd
 import pytest
+
 from marginfx.core import (
-    me_at_point,
-    marginal_effects,
-    ame,
-    all_ames,
     MarginfxResult,
+    compute_adaptive_h,
+    contrast,
+    plugin_ame,
+    plugin_ames,
+    pointwise_effects,
+    resolve_categorical,
+    resolve_h,
+    support_bounds,
+    trimming_weight,
+    window_difference,
 )
 
 
@@ -41,13 +51,12 @@ def rng():
 
 @pytest.fixture
 def X_linear(rng):
-    """Simple 2-feature dataset for linear function tests."""
-    return rng.standard_normal((100, 2))
+    return rng.standard_normal((200, 2))
 
 
 @pytest.fixture
 def linear_predict_fn():
-    """f(x) = 2*x1 + 3*x2 — true AMEs are exactly [2.0, 3.0]."""
+    """f(x) = 2*x0 + 3*x1 -- D_h f is exactly [2.0, 3.0] at any h."""
     def predict_fn(X):
         return 2.0 * X[:, 0] + 3.0 * X[:, 1]
     return predict_fn
@@ -55,304 +64,291 @@ def linear_predict_fn():
 
 @pytest.fixture
 def quadratic_predict_fn():
-    """f(x) = x1^2 + x2 — true ME at point x1 is 2*x1."""
+    """f(x) = x0^2 + x1 -- D_h f for x0 is exactly 2*x0 at any h."""
     def predict_fn(X):
         return X[:, 0] ** 2 + X[:, 1]
     return predict_fn
 
 
-@pytest.fixture
-def binary_predict_fn():
-    """f(x) = x1 (binary, values 0 and 1)."""
-    def predict_fn(X):
-        return X[:, 0]
-    return predict_fn
+# ---------------------------------------------------------------------------
+# Step size
+# ---------------------------------------------------------------------------
 
+class TestAdaptiveH:
 
-@pytest.fixture
-def X_categorical(rng):
-    """Dataset with binary first feature."""
-    X = rng.standard_normal((100, 2))
-    X[:, 0] = rng.integers(0, 2, size=100).astype(float)
-    return X
+    def test_formula(self, rng):
+        X = rng.standard_normal((500, 3)) * np.array([1.0, 5.0, 20.0])
+        h = compute_adaptive_h(X)
+        np.testing.assert_allclose(h, 0.05 * X.std(axis=0))
+
+    def test_floor_applies_to_constant_feature(self):
+        X = np.column_stack([np.ones(50), np.arange(50, dtype=float)])
+        h = compute_adaptive_h(X)
+        assert h[0] == pytest.approx(1e-4)
+
+    def test_no_integer_floor(self, rng):
+        """
+        An earlier version raised h to 0.5 for integer-valued features so that
+        differences would cross tree split thresholds. Under the window
+        estimand h defines the target, so that floor silently changed what was
+        being estimated. It must not come back.
+        """
+        X = np.column_stack([
+            rng.integers(1, 17, size=500).astype(float),
+            rng.standard_normal(500),
+        ])
+        h = compute_adaptive_h(X)
+        assert h[0] == pytest.approx(0.05 * X[:, 0].std())
+        assert h[0] < 0.5
+
+    def test_resolve_scalar(self, X_linear):
+        h = resolve_h(X_linear, 0.01)
+        np.testing.assert_allclose(h, np.full(2, 0.01))
+
+    def test_resolve_array(self, X_linear):
+        h = resolve_h(X_linear, np.array([0.1, 0.2]))
+        np.testing.assert_allclose(h, [0.1, 0.2])
+
+    def test_resolve_rejects_bad_string(self, X_linear):
+        with pytest.raises(ValueError):
+            resolve_h(X_linear, 'auto')
+
+    def test_resolve_rejects_wrong_length(self, X_linear):
+        with pytest.raises(ValueError):
+            resolve_h(X_linear, np.array([0.1, 0.2, 0.3]))
 
 
 # ---------------------------------------------------------------------------
-# me_at_point tests
+# Trimming
 # ---------------------------------------------------------------------------
 
-class TestMeAtPoint:
+class TestTrimming:
 
-    def test_linear_exact(self, linear_predict_fn):
-        """For f(x) = 2*x1 + 3*x2, ME at any point w.r.t. x1 is exactly 2."""
-        x = np.array([1.0, 1.0])
-        result = me_at_point(x, feature_idx=0, predict_fn=linear_predict_fn)
-        assert abs(result - 2.0) < 1e-6
+    def test_excludes_boundary_points(self):
+        X = np.linspace(0.0, 1.0, 101).reshape(-1, 1)
+        w = trimming_weight(X, 0, h=0.1)
+        # Points within 0.1 of either end fall outside Omega_{j,h}.
+        assert w[0] == 0.0
+        assert w[-1] == 0.0
+        assert w[50] == 1.0
 
-    def test_linear_second_feature(self, linear_predict_fn):
-        """For f(x) = 2*x1 + 3*x2, ME at any point w.r.t. x2 is exactly 3."""
-        x = np.array([1.0, 1.0])
-        result = me_at_point(x, feature_idx=1, predict_fn=linear_predict_fn)
-        assert abs(result - 3.0) < 1e-6
+    def test_weights_are_binary(self, X_linear):
+        w = trimming_weight(X_linear, 0, h=0.05)
+        assert set(np.unique(w)) <= {0.0, 1.0}
 
-    def test_quadratic_at_known_point(self, quadratic_predict_fn):
-        """For f(x) = x1^2 + x2, ME at x1=2 w.r.t. x1 is 2*2=4."""
-        x = np.array([2.0, 0.0])
-        result = me_at_point(x, feature_idx=0, predict_fn=quadratic_predict_fn)
-        assert abs(result - 4.0) < 1e-4
+    def test_larger_h_trims_more(self, X_linear):
+        small = trimming_weight(X_linear, 0, h=0.01).mean()
+        large = trimming_weight(X_linear, 0, h=0.5).mean()
+        assert large <= small
 
-    def test_quadratic_negative_point(self, quadratic_predict_fn):
-        """For f(x) = x1^2 + x2, ME at x1=-3 w.r.t. x1 is 2*(-3)=-6."""
-        x = np.array([-3.0, 0.0])
-        result = me_at_point(x, feature_idx=0, predict_fn=quadratic_predict_fn)
-        assert abs(result - (-6.0)) < 1e-4
+    def test_explicit_bounds_are_respected(self, X_linear):
+        """
+        Trimming must be computable against fixed global bounds, so that a
+        subsample does not silently retarget the estimand.
+        """
+        bounds = support_bounds(X_linear)
+        sub = X_linear[:20]
+        w_global = trimming_weight(sub, 0, 0.1, bounds)
+        w_local = trimming_weight(sub, 0, 0.1)
+        # Against the wider global support, no fewer points survive.
+        assert w_global.sum() >= w_local.sum()
 
-    def test_categorical_first_difference(self, binary_predict_fn):
-        """For f(x) = x1 (binary), first difference is 1 - 0 = 1."""
-        x = np.array([0.5, 1.0])  # current value doesn't matter for categorical
-        result = me_at_point(
-            x, feature_idx=0,
-            predict_fn=binary_predict_fn,
-            is_categorical=True,
+    def test_support_bounds(self, X_linear):
+        lower, upper = support_bounds(X_linear)
+        np.testing.assert_allclose(lower, X_linear.min(axis=0))
+        np.testing.assert_allclose(upper, X_linear.max(axis=0))
+
+
+# ---------------------------------------------------------------------------
+# Difference operator
+# ---------------------------------------------------------------------------
+
+class TestWindowDifference:
+
+    def test_exact_for_linear(self, X_linear, linear_predict_fn):
+        for h in [1e-4, 0.05, 1.0]:
+            d0 = window_difference(X_linear, 0, linear_predict_fn, h)
+            d1 = window_difference(X_linear, 1, linear_predict_fn, h)
+            np.testing.assert_allclose(d0, 2.0)
+            np.testing.assert_allclose(d1, 3.0)
+
+    def test_centered_difference_exact_for_quadratic(
+        self, X_linear, quadratic_predict_fn
+    ):
+        """The h^2 terms cancel in a centered difference, so this is exact."""
+        d = window_difference(X_linear, 0, quadratic_predict_fn, 0.3)
+        np.testing.assert_allclose(d, 2.0 * X_linear[:, 0], atol=1e-10)
+
+    def test_does_not_mutate_input(self, X_linear, linear_predict_fn):
+        before = X_linear.copy()
+        window_difference(X_linear, 0, linear_predict_fn, 0.1)
+        np.testing.assert_array_equal(X_linear, before)
+
+    def test_shape(self, X_linear, linear_predict_fn):
+        assert window_difference(
+            X_linear, 0, linear_predict_fn, 0.1
+        ).shape == (200,)
+
+
+class TestContrast:
+
+    def test_switches_zero_to_one(self):
+        X = np.column_stack([np.zeros(10), np.arange(10, dtype=float)])
+        c = contrast(X, 0, lambda Z: 5.0 * Z[:, 0])
+        np.testing.assert_allclose(c, 5.0)
+
+    def test_holds_other_features_fixed(self):
+        X = np.column_stack([np.zeros(5), np.array([1.0, 2, 3, 4, 5])])
+        c = contrast(X, 0, lambda Z: Z[:, 0] * Z[:, 1])
+        np.testing.assert_allclose(c, X[:, 1])
+
+    def test_does_not_mutate_input(self):
+        X = np.column_stack([np.zeros(5), np.ones(5)])
+        before = X.copy()
+        contrast(X, 0, lambda Z: Z[:, 0])
+        np.testing.assert_array_equal(X, before)
+
+
+# ---------------------------------------------------------------------------
+# Plug-in
+# ---------------------------------------------------------------------------
+
+class TestPlugin:
+
+    def test_linear_recovers_beta_times_weight(
+        self, X_linear, linear_predict_fn
+    ):
+        h = 0.05
+        w = trimming_weight(X_linear, 0, h)
+        est = plugin_ame(X_linear, 0, linear_predict_fn, h, weights=w)
+        assert est == pytest.approx(2.0 * w.mean())
+
+    def test_not_renormalized_by_weight_mass(self, linear_predict_fn):
+        """
+        theta_{j,h} = E[w D_h f], not E[w D_h f] / E[w]. Renormalizing would
+        target the effect conditional on being untrimmed, a different
+        functional.
+        """
+        X = np.column_stack([np.linspace(0.0, 1.0, 101), np.zeros(101)])
+        h = 0.2
+        w = trimming_weight(X, 0, h)
+        est = plugin_ame(X, 0, linear_predict_fn, h, weights=w)
+        assert est == pytest.approx(2.0 * w.mean())
+        assert est < 2.0  # strictly shrunk by trimming
+
+    def test_weights_none_means_untrimmed(self, X_linear, linear_predict_fn):
+        est = plugin_ame(X_linear, 0, linear_predict_fn, 0.05, weights=None)
+        assert est == pytest.approx(2.0)
+
+    def test_pointwise_effects_categorical_ignores_h(self):
+        X = np.column_stack([np.zeros(10), np.ones(10)])
+        eff = pointwise_effects(
+            X, 0, lambda Z: 3.0 * Z[:, 0], h=99.0, is_categorical=True
         )
-        assert abs(result - 1.0) < 1e-10
+        np.testing.assert_allclose(eff, 3.0)
 
-    def test_returns_float(self, linear_predict_fn):
-        """me_at_point should always return a Python float."""
-        x = np.array([1.0, 1.0])
-        result = me_at_point(x, feature_idx=0, predict_fn=linear_predict_fn)
-        assert isinstance(result, float)
+    def test_all_features(self, X_linear, linear_predict_fn):
+        out = plugin_ames(X_linear, linear_predict_fn, trim=False)
+        assert out['x0'] == pytest.approx(2.0)
+        assert out['x1'] == pytest.approx(3.0)
 
-    def test_h_sensitivity(self, quadratic_predict_fn):
-        """Smaller h should give more accurate result for smooth functions."""
-        x = np.array([1.0, 0.0])
-        true_me = 2.0  # 2 * x1 at x1=1
-
-        result_large_h = me_at_point(
-            x, feature_idx=0,
-            predict_fn=quadratic_predict_fn,
-            h=1e-1,
+    def test_feature_names_used(self, X_linear, linear_predict_fn):
+        out = plugin_ames(
+            X_linear, linear_predict_fn, feature_names=['a', 'b'], trim=False
         )
-        result_small_h = me_at_point(
-            x, feature_idx=0,
-            predict_fn=quadratic_predict_fn,
-            h=1e-5,
-        )
+        assert set(out) == {'a', 'b'}
 
-        assert abs(result_large_h - true_me) < 0.01
-        assert abs(result_small_h - true_me) < 0.01
+    def test_trimming_shrinks_estimate(self, X_linear, linear_predict_fn):
+        trimmed = plugin_ames(X_linear, linear_predict_fn, h=0.5, trim=True)
+        untrimmed = plugin_ames(X_linear, linear_predict_fn, h=0.5, trim=False)
+        assert abs(trimmed['x0']) < abs(untrimmed['x0'])
 
-# ---------------------------------------------------------------------------
-# marginal_effects tests
-# ---------------------------------------------------------------------------
 
-class TestMarginalEffects:
+class TestResolveCategorical:
 
-    def test_returns_correct_shape(self, X_linear, linear_predict_fn):
-        """marginal_effects should return vector of length n_obs."""
-        result = marginal_effects(X_linear, feature_idx=0, predict_fn=linear_predict_fn)
-        assert result.shape == (X_linear.shape[0],)
+    def test_by_name(self):
+        assert resolve_categorical(['b'], ['a', 'b', 'c']) == {1}
 
-    def test_linear_all_equal(self, X_linear, linear_predict_fn):
-        """For linear f, ME is constant across all observations."""
-        result = marginal_effects(X_linear, feature_idx=0, predict_fn=linear_predict_fn)
-        assert np.allclose(result, 2.0, atol=1e-6)
+    def test_by_index(self):
+        assert resolve_categorical([0, 2], ['a', 'b', 'c']) == {0, 2}
 
-    def test_quadratic_varies_by_observation(self, X_linear, quadratic_predict_fn):
-        """For f(x) = x1^2, ME at point x1 is 2*x1 — varies across observations."""
-        result = marginal_effects(X_linear, feature_idx=0, predict_fn=quadratic_predict_fn)
-        expected = 2.0 * X_linear[:, 0]
-        assert np.allclose(result, expected, atol=1e-4)
+    def test_none_is_empty(self):
+        assert resolve_categorical(None, ['a']) == set()
 
-    def test_categorical_returns_first_differences(self, X_categorical, binary_predict_fn):
-        """Categorical ME should be first difference, not derivative."""
-        result = marginal_effects(
-            X_categorical,
-            feature_idx=0,
-            predict_fn=binary_predict_fn,
-            is_categorical=True,
-        )
-        # f(x) = x1, first difference is always 1 - 0 = 1
-        assert np.allclose(result, 1.0, atol=1e-10)
+    def test_unknown_name_raises(self):
+        with pytest.raises(ValueError):
+            resolve_categorical(['zzz'], ['a', 'b'])
 
-    def test_returns_ndarray(self, X_linear, linear_predict_fn):
-        """marginal_effects should return numpy array."""
-        result = marginal_effects(X_linear, feature_idx=0, predict_fn=linear_predict_fn)
-        assert isinstance(result, np.ndarray)
+    def test_bad_type_raises(self):
+        with pytest.raises(TypeError):
+            resolve_categorical([1.5], ['a', 'b'])
 
 
 # ---------------------------------------------------------------------------
-# ame tests
-# ---------------------------------------------------------------------------
-
-class TestAme:
-
-    def test_linear_exact(self, X_linear, linear_predict_fn):
-        """AME of linear function should be exact coefficient."""
-        result_x1 = ame(X_linear, feature_idx=0, predict_fn=linear_predict_fn)
-        result_x2 = ame(X_linear, feature_idx=1, predict_fn=linear_predict_fn)
-        assert abs(result_x1 - 2.0) < 1e-6
-        assert abs(result_x2 - 3.0) < 1e-6
-
-    def test_ame_is_mean_of_marginal_effects(self, X_linear, quadratic_predict_fn):
-        """AME should equal mean of marginal_effects vector."""
-        me_vec = marginal_effects(X_linear, feature_idx=0, predict_fn=quadratic_predict_fn)
-        ame_result = ame(X_linear, feature_idx=0, predict_fn=quadratic_predict_fn)
-        assert abs(ame_result - np.mean(me_vec)) < 1e-10
-
-    def test_returns_float(self, X_linear, linear_predict_fn):
-        """ame should return a Python float."""
-        result = ame(X_linear, feature_idx=0, predict_fn=linear_predict_fn)
-        assert isinstance(result, float)
-
-    def test_categorical(self, X_categorical, binary_predict_fn):
-        """AME for categorical feature should be mean first difference."""
-        result = ame(
-            X_categorical,
-            feature_idx=0,
-            predict_fn=binary_predict_fn,
-            is_categorical=True,
-        )
-        assert abs(result - 1.0) < 1e-10
-
-
-# ---------------------------------------------------------------------------
-# all_ames tests
-# ---------------------------------------------------------------------------
-
-class TestAllAmes:
-
-    def test_returns_dict(self, X_linear, linear_predict_fn):
-        """all_ames should return a dictionary."""
-        result = all_ames(X_linear, predict_fn=linear_predict_fn)
-        assert isinstance(result, dict)
-
-    def test_correct_number_of_features(self, X_linear, linear_predict_fn):
-        """all_ames should return one entry per feature."""
-        result = all_ames(X_linear, predict_fn=linear_predict_fn)
-        assert len(result) == X_linear.shape[1]
-
-    def test_default_feature_names(self, X_linear, linear_predict_fn):
-        """Default feature names should be x0, x1, ..."""
-        result = all_ames(X_linear, predict_fn=linear_predict_fn)
-        assert list(result.keys()) == ['x0', 'x1']
-
-    def test_custom_feature_names(self, X_linear, linear_predict_fn):
-        """Custom feature names should be used as keys."""
-        result = all_ames(
-            X_linear,
-            predict_fn=linear_predict_fn,
-            feature_names=['age', 'income'],
-        )
-        assert list(result.keys()) == ['age', 'income']
-
-    def test_linear_correct_values(self, X_linear, linear_predict_fn):
-        """For f(x) = 2*x1 + 3*x2, all_ames should return {x0: 2.0, x1: 3.0}."""
-        result = all_ames(X_linear, predict_fn=linear_predict_fn)
-        assert abs(result['x0'] - 2.0) < 1e-6
-        assert abs(result['x1'] - 3.0) < 1e-6
-
-    def test_categorical_by_index(self, X_categorical, binary_predict_fn):
-        """Categorical features specified by index should use first differences."""
-        result = all_ames(
-            X_categorical,
-            predict_fn=binary_predict_fn,
-            categorical_features=[0],
-        )
-        assert abs(result['x0'] - 1.0) < 1e-10
-
-    def test_categorical_by_name(self, X_categorical, binary_predict_fn):
-        """Categorical features specified by name should use first differences."""
-        result = all_ames(
-            X_categorical,
-            predict_fn=binary_predict_fn,
-            feature_names=['binary_var', 'continuous_var'],
-            categorical_features=['binary_var'],
-        )
-        assert abs(result['binary_var'] - 1.0) < 1e-10
-
-
-# ---------------------------------------------------------------------------
-# MarginfxResult tests
+# Result container
 # ---------------------------------------------------------------------------
 
 class TestMarginfxResult:
 
-    @pytest.fixture
-    def result_no_bootstrap(self):
-        """MarginfxResult with point estimates only."""
-        return MarginfxResult(
-            estimates={'age': 0.032, 'income': 0.008},
-            n_obs=1000,
-        )
-
-    @pytest.fixture
-    def result_with_bootstrap(self):
-        """MarginfxResult with full bootstrap output."""
-        return MarginfxResult(
-            estimates={'age': 0.032, 'income': 0.008},
-            std_errors={'age': 0.004, 'income': 0.001},
-            conf_int={'age': (0.024, 0.040), 'income': (0.006, 0.010)},
-            n_obs=1000,
-            n_bootstrap=200,
-            alpha=0.05,
-        )
-
-    def test_tidy_returns_dataframe(self, result_no_bootstrap):
-        """tidy() should return a pandas DataFrame."""
-        df = result_no_bootstrap.tidy()
+    def test_tidy_minimal(self):
+        r = MarginfxResult(estimates={'a': 1.0, 'b': 2.0}, n_obs=10)
+        df = r.tidy()
         assert isinstance(df, pd.DataFrame)
+        assert list(df['term']) == ['a', 'b']
+        assert 'std_error' not in df.columns
 
-    def test_tidy_has_term_column(self, result_no_bootstrap):
-        """tidy() DataFrame should have a 'term' column."""
-        df = result_no_bootstrap.tidy()
-        assert 'term' in df.columns
+    def test_tidy_with_inference(self):
+        r = MarginfxResult(
+            estimates={'a': 2.0},
+            std_errors={'a': 0.5},
+            conf_int={'a': (1.0, 3.0)},
+            h={'a': 0.05},
+            trimmed_fraction={'a': 0.01},
+            n_obs=100,
+        )
+        row = r.tidy().iloc[0]
+        assert row['statistic'] == pytest.approx(4.0)
+        assert row['p_value'] < 0.001
+        assert row['conf_low'] == 1.0
+        assert row['h'] == 0.05
+        assert row['trimmed'] == 0.01
 
-    def test_tidy_has_estimate_column(self, result_no_bootstrap):
-        """tidy() DataFrame should have an 'estimate' column."""
-        df = result_no_bootstrap.tidy()
-        assert 'estimate' in df.columns
+    def test_zero_se_gives_nan_statistic(self):
+        r = MarginfxResult(estimates={'a': 1.0}, std_errors={'a': 0.0},
+                           n_obs=5)
+        assert np.isnan(r.tidy().iloc[0]['statistic'])
 
-    def test_tidy_correct_values(self, result_no_bootstrap):
-        """tidy() estimates should match input."""
-        df = result_no_bootstrap.tidy()
-        age_row = df[df['term'] == 'age'].iloc[0]
-        assert abs(age_row['estimate'] - 0.032) < 1e-10
+    def test_simultaneous_columns(self):
+        r = MarginfxResult(
+            estimates={'a': 1.0},
+            std_errors={'a': 0.5},
+            conf_int={'a': (0.0, 2.0)},
+            simultaneous_conf_int={'a': (-0.5, 2.5)},
+            n_obs=10,
+        )
+        row = r.tidy().iloc[0]
+        assert row['simul_low'] == -0.5
+        assert row['simul_high'] == 2.5
 
-    def test_tidy_with_bootstrap_has_se(self, result_with_bootstrap):
-        """tidy() with bootstrap should include std_error column."""
-        df = result_with_bootstrap.tidy()
-        assert 'std_error' in df.columns
+    def test_summary_runs(self, capsys):
+        r = MarginfxResult(
+            estimates={'a': 1.0}, std_errors={'a': 0.2},
+            conf_int={'a': (0.6, 1.4)}, n_obs=50, method='debiased',
+            n_folds=5,
+        )
+        r.summary()
+        out = capsys.readouterr().out
+        assert 'Window Average Marginal Effects' in out
+        assert 'debiased cross-fitted' in out
 
-    def test_tidy_with_bootstrap_has_ci(self, result_with_bootstrap):
-        """tidy() with bootstrap should include conf_low and conf_high."""
-        df = result_with_bootstrap.tidy()
-        assert 'conf_low' in df.columns
-        assert 'conf_high' in df.columns
+    def test_summary_warns_for_diagnostic(self, capsys):
+        r = MarginfxResult(
+            estimates={'a': 1.0}, std_errors={'a': 0.2},
+            n_obs=50, method='bootstrap-diagnostic', n_bootstrap=100,
+        )
+        r.summary()
+        assert 'not' in capsys.readouterr().out.lower()
 
-    def test_tidy_with_bootstrap_has_pvalue(self, result_with_bootstrap):
-        """tidy() with bootstrap should include p_value."""
-        df = result_with_bootstrap.tidy()
-        assert 'p_value' in df.columns
-
-    def test_tidy_correct_number_of_rows(self, result_with_bootstrap):
-        """tidy() should have one row per feature."""
-        df = result_with_bootstrap.tidy()
-        assert len(df) == 2
-
-    def test_conf_int_ordering(self, result_with_bootstrap):
-        """conf_low should always be less than conf_high."""
-        df = result_with_bootstrap.tidy()
-        assert (df['conf_low'] < df['conf_high']).all()
-
-    def test_repr(self, result_with_bootstrap):
-        """__repr__ should return a readable string."""
-        r = repr(result_with_bootstrap)
-        assert 'MarginfxResult' in r
-        assert 'features=2' in r
-
-    def test_summary_runs(self, result_with_bootstrap, capsys):
-        """summary() should print without error."""
-        result_with_bootstrap.summary()
-        captured = capsys.readouterr()
-        assert 'marginfx' in captured.out.lower()
+    def test_repr(self):
+        r = MarginfxResult(estimates={'a': 1.0}, n_obs=7)
+        assert 'MarginfxResult' in repr(r)

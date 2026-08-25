@@ -6,11 +6,9 @@ Unit tests for engines/pytorch.py.
 Tests cover:
     - predict_fn output shape and range
     - predict_fn runs in eval mode
-    - gradient_ame_fn correctness vs finite differences
-    - gradient_ame_fn categorical first difference fallback
     - fit_fn warm-start refit produces working model in eval mode
     - fit_fn does not mutate original model weights
-    - get_engine() returns three callables
+    - get_engine() returns two callables
     - Gradient accuracy on known linear model
 
 All tests are skipped if PyTorch is not installed.
@@ -26,7 +24,6 @@ from marginfx.engines.pytorch import (
     get_engine,
     make_predict_fn,
     make_fit_fn,
-    make_gradient_ame_fn,
     DEFAULT_OPTIMIZER_FN,
 )
 
@@ -187,109 +184,6 @@ class TestPredictFn:
 
 
 # ---------------------------------------------------------------------------
-# gradient_ame_fn tests
-# ---------------------------------------------------------------------------
-
-class TestGradientAmeFn:
-
-    def test_output_shape(self, binary_classifier):
-        """gradient_ame_fn should return shape (n_obs,)."""
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-        result = grad_fn(X, feature_idx=0)
-        assert result.shape == (X.shape[0],)
-
-    def test_output_is_numpy(self, binary_classifier):
-        """gradient_ame_fn should return numpy array."""
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-        result = grad_fn(X, feature_idx=0)
-        assert isinstance(result, np.ndarray)
-
-    def test_linear_model_exact_gradients(self, linear_model_torch, rng):
-        """
-        For f(x) = 2*x1 + 3*x2, exact gradients should be:
-            df/dx1 = 2.0 for all observations
-            df/dx2 = 3.0 for all observations
-        """
-        X = rng.standard_normal((50, 4)).astype(np.float32)
-        grad_fn = make_gradient_ame_fn(linear_model_torch)
-
-        grads_x1 = grad_fn(X, feature_idx=0)
-        grads_x2 = grad_fn(X, feature_idx=1)
-
-        assert np.allclose(grads_x1, 2.0, atol=1e-5), \
-            f"Expected gradient 2.0, got {grads_x1.mean():.6f}"
-        assert np.allclose(grads_x2, 3.0, atol=1e-5), \
-            f"Expected gradient 3.0, got {grads_x2.mean():.6f}"
-
-    def test_gradient_close_to_finite_difference(self, binary_classifier):
-        """
-        Exact gradients should be numerically close to finite differences
-        for a smooth sigmoid model.
-        """
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-        predict_fn = make_predict_fn(model)
-
-        X_small = X[:20]
-
-        # Exact gradient
-        exact_grads = grad_fn(X_small, feature_idx=0)
-
-        # Finite difference approximation
-        h = 1e-4
-        X_plus = X_small.copy()
-        X_minus = X_small.copy()
-        X_plus[:, 0] += h
-        X_minus[:, 0] -= h
-        fd_grads = (predict_fn(X_plus) - predict_fn(X_minus)) / (2 * h)
-
-        assert np.allclose(exact_grads, fd_grads, atol=1e-3), \
-            f"Exact gradients not close to finite differences. " \
-            f"Max diff: {np.abs(exact_grads - fd_grads).max():.6f}"
-
-    def test_categorical_uses_first_difference(self, binary_classifier):
-        """
-        Categorical features should use first difference not autograd.
-        """
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-
-        X_cat = X.copy()
-        X_cat[:, 0] = (X_cat[:, 0] > 0).astype(np.float32)
-
-        result = grad_fn(X_cat, feature_idx=0, is_categorical=True)
-        assert result.shape == (X_cat.shape[0],)
-        assert isinstance(result, np.ndarray)
-
-    def test_zero_gradient_for_unused_feature(self, linear_model_torch, rng):
-        """
-        For f(x) = 2*x1 + 3*x2 + 0*x3 + 0*x4,
-        gradients w.r.t. x3 and x4 should be zero.
-        """
-        X = rng.standard_normal((50, 4)).astype(np.float32)
-        grad_fn = make_gradient_ame_fn(linear_model_torch)
-
-        grads_x3 = grad_fn(X, feature_idx=2)
-        grads_x4 = grad_fn(X, feature_idx=3)
-
-        assert np.allclose(grads_x3, 0.0, atol=1e-5)
-        assert np.allclose(grads_x4, 0.0, atol=1e-5)
-
-    def test_model_stays_in_eval_mode(self, binary_classifier):
-        """gradient_ame_fn should leave model in eval mode."""
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-        _ = grad_fn(X, feature_idx=0)
-        assert not model.training, \
-            "Model should remain in eval mode after gradient computation"
-
-
-# ---------------------------------------------------------------------------
-# fit_fn tests
-# ---------------------------------------------------------------------------
-
 class TestFitFn:
 
     def test_returns_pytorch_module(self, binary_classifier):
@@ -417,35 +311,28 @@ class TestFitFn:
 
 class TestGetEngine:
 
-    def test_returns_three_callables(self, binary_classifier):
-        """get_engine should return (predict_fn, fit_fn, gradient_ame_fn)."""
+    def test_returns_two_callables(self, binary_classifier):
+        """get_engine should return (predict_fn, fit_fn)."""
         model, X, y = binary_classifier
         result = get_engine(model)
 
-        assert len(result) == 3
-        predict_fn, fit_fn, gradient_ame_fn = result
+        assert len(result) == 2
+        predict_fn, fit_fn = result
         assert callable(predict_fn)
         assert callable(fit_fn)
-        assert callable(gradient_ame_fn)
 
     def test_predict_fn_works(self, binary_classifier):
         """predict_fn from get_engine should return correct shape."""
         model, X, y = binary_classifier
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(model)
+        predict_fn, fit_fn = get_engine(model)
         result = predict_fn(X)
         assert result.shape == (X.shape[0],)
 
-    def test_gradient_ame_fn_works(self, binary_classifier):
-        """gradient_ame_fn from get_engine should return correct shape."""
-        model, X, y = binary_classifier
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(model)
-        result = gradient_ame_fn(X, feature_idx=0)
-        assert result.shape == (X.shape[0],)
 
     def test_fit_fn_works(self, binary_classifier):
         """fit_fn from get_engine should return a fitted model."""
         model, X, y = binary_classifier
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(model)
+        predict_fn, fit_fn = get_engine(model)
 
         idx = np.random.default_rng(42).integers(0, X.shape[0], size=X.shape[0])
         X_boot, y_boot = X[idx], y[idx]
@@ -458,7 +345,7 @@ class TestGetEngine:
         model, X, y = binary_classifier
 
         custom_opt = lambda params: torch.optim.SGD(params, lr=0.01)
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(
+        predict_fn, fit_fn = get_engine(
             model,
             optimizer_fn=custom_opt,
             n_epochs=2,
@@ -474,7 +361,7 @@ class TestGetEngine:
         """Custom loss_fn should be passed through to fit_fn."""
         model, X, y = regressor
 
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(
+        predict_fn, fit_fn = get_engine(
             model,
             loss_fn=nn.MSELoss(),
             n_epochs=2,

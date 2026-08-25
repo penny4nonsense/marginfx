@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "marginfx"
-version = "0.1.0"
-description = "Average marginal effects and bootstrap standard errors for any machine learning model."
+version = "0.2.0"
+description = "Window average marginal effects with debiased cross-fitted inference for any machine learning model."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -17,7 +17,10 @@ keywords = [
     "interpretability",
     "explainability",
     "machine learning",
-    "bootstrap",
+    "causal inference",
+    "debiased machine learning",
+    "riesz representer",
+    "cross-fitting",
     "scikit-learn",
     "xgboost",
     "tensorflow",
@@ -92,6 +95,9 @@ packages = ["marginfx"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=marginfx --cov-report=term-missing --ignore=tests/engines/test_pytorch.py --ignore=tests/engines/test_tensorflow.py --no-cov-on-fail"
+markers = [
+    "slow: Monte Carlo tests over many replications; deselect with -m 'not slow'",
+]
 
 [tool.coverage.run]
 parallel = false

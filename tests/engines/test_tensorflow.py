@@ -5,11 +5,9 @@ Unit tests for engines/tensorflow.py.
 
 Tests cover:
     - predict_fn output shape and range for classification and regression
-    - gradient_ame_fn correctness vs finite differences
-    - gradient_ame_fn categorical first difference fallback
     - fit_fn warm-start refit produces a working model
     - fit_fn does not mutate original model weights
-    - get_engine() returns three callables
+    - get_engine() returns two callables
     - Gradient accuracy on known linear model
 
 All tests are skipped if TensorFlow is not installed.
@@ -24,7 +22,6 @@ from marginfx.engines.tensorflow import (
     get_engine,
     make_predict_fn,
     make_fit_fn,
-    make_gradient_ame_fn,
 )
 
 
@@ -150,104 +147,6 @@ class TestPredictFn:
 
 
 # ---------------------------------------------------------------------------
-# gradient_ame_fn tests
-# ---------------------------------------------------------------------------
-
-class TestGradientAmeFn:
-
-    def test_output_shape(self, binary_classifier):
-        """gradient_ame_fn should return shape (n_obs,)."""
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-        result = grad_fn(X, feature_idx=0)
-        assert result.shape == (X.shape[0],)
-
-    def test_output_is_numpy(self, binary_classifier):
-        """gradient_ame_fn should return numpy array."""
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-        result = grad_fn(X, feature_idx=0)
-        assert isinstance(result, np.ndarray)
-
-    def test_linear_model_exact_gradients(self, linear_model_tf, rng):
-        """
-        For f(x) = 2*x1 + 3*x2, exact gradients should be:
-            df/dx1 = 2.0 for all observations
-            df/dx2 = 3.0 for all observations
-        """
-        X = rng.standard_normal((50, 4)).astype(np.float32)
-        grad_fn = make_gradient_ame_fn(linear_model_tf)
-
-        grads_x1 = grad_fn(X, feature_idx=0)
-        grads_x2 = grad_fn(X, feature_idx=1)
-
-        assert np.allclose(grads_x1, 2.0, atol=1e-5), \
-            f"Expected gradient 2.0, got {grads_x1.mean():.6f}"
-        assert np.allclose(grads_x2, 3.0, atol=1e-5), \
-            f"Expected gradient 3.0, got {grads_x2.mean():.6f}"
-
-    def test_gradient_close_to_finite_difference(self, binary_classifier, rng):
-        """
-        Exact gradients should be close to finite difference approximation
-        for a smooth model. Tests numerical consistency.
-        """
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-        predict_fn = make_predict_fn(model)
-
-        # Use small subset for speed
-        X_small = X[:20]
-
-        # Exact gradient
-        exact_grads = grad_fn(X_small, feature_idx=0)
-
-        # Finite difference approximation
-        h = 1e-4
-        X_plus = X_small.copy()
-        X_minus = X_small.copy()
-        X_plus[:, 0] += h
-        X_minus[:, 0] -= h
-        fd_grads = (predict_fn(X_plus) - predict_fn(X_minus)) / (2 * h)
-
-        assert np.allclose(exact_grads, fd_grads, atol=1e-3), \
-            f"Exact gradients not close to finite differences. " \
-            f"Max diff: {np.abs(exact_grads - fd_grads).max():.6f}"
-
-    def test_categorical_uses_first_difference(self, binary_classifier):
-        """
-        For categorical features, gradient_ame_fn should use first differences
-        not autograd.
-        """
-        model, X, y = binary_classifier
-        grad_fn = make_gradient_ame_fn(model)
-
-        # Force first column to binary
-        X_cat = X.copy()
-        X_cat[:, 0] = (X_cat[:, 0] > 0).astype(np.float32)
-
-        result = grad_fn(X_cat, feature_idx=0, is_categorical=True)
-        assert result.shape == (X_cat.shape[0],)
-        assert isinstance(result, np.ndarray)
-
-    def test_zero_gradient_for_unused_feature(self, linear_model_tf, rng):
-        """
-        For f(x) = 2*x1 + 3*x2 + 0*x3 + 0*x4,
-        gradient w.r.t. x3 and x4 should be zero.
-        """
-        X = rng.standard_normal((50, 4)).astype(np.float32)
-        grad_fn = make_gradient_ame_fn(linear_model_tf)
-
-        grads_x3 = grad_fn(X, feature_idx=2)
-        grads_x4 = grad_fn(X, feature_idx=3)
-
-        assert np.allclose(grads_x3, 0.0, atol=1e-5)
-        assert np.allclose(grads_x4, 0.0, atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# fit_fn tests
-# ---------------------------------------------------------------------------
-
 class TestFitFn:
 
     def test_returns_keras_model(self, binary_classifier):
@@ -341,35 +240,28 @@ class TestFitFn:
 
 class TestGetEngine:
 
-    def test_returns_three_callables(self, binary_classifier):
-        """get_engine should return (predict_fn, fit_fn, gradient_ame_fn)."""
+    def test_returns_two_callables(self, binary_classifier):
+        """get_engine should return (predict_fn, fit_fn)."""
         model, X, y = binary_classifier
         result = get_engine(model)
 
-        assert len(result) == 3
-        predict_fn, fit_fn, gradient_ame_fn = result
+        assert len(result) == 2
+        predict_fn, fit_fn = result
         assert callable(predict_fn)
         assert callable(fit_fn)
-        assert callable(gradient_ame_fn)
 
     def test_predict_fn_works(self, binary_classifier):
         """predict_fn from get_engine should return correct shape."""
         model, X, y = binary_classifier
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(model)
+        predict_fn, fit_fn = get_engine(model)
         result = predict_fn(X)
         assert result.shape == (X.shape[0],)
 
-    def test_gradient_ame_fn_works(self, binary_classifier):
-        """gradient_ame_fn from get_engine should return correct shape."""
-        model, X, y = binary_classifier
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(model)
-        result = gradient_ame_fn(X, feature_idx=0)
-        assert result.shape == (X.shape[0],)
 
     def test_fit_fn_works(self, binary_classifier):
         """fit_fn from get_engine should return a fitted model."""
         model, X, y = binary_classifier
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(model)
+        predict_fn, fit_fn = get_engine(model)
 
         idx = np.random.default_rng(42).integers(0, X.shape[0], size=X.shape[0])
         X_boot, y_boot = X[idx], y[idx]
@@ -380,7 +272,7 @@ class TestGetEngine:
     def test_n_epochs_passthrough(self, binary_classifier):
         """n_epochs should be passed through to fit_fn."""
         model, X, y = binary_classifier
-        predict_fn, fit_fn, gradient_ame_fn = get_engine(model, n_epochs=3)
+        predict_fn, fit_fn = get_engine(model, n_epochs=3)
 
         idx = np.random.default_rng(42).integers(0, X.shape[0], size=X.shape[0])
         X_boot, y_boot = X[idx], y[idx]

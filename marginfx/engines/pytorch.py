@@ -97,85 +97,6 @@ def make_predict_fn(model) -> Callable:
     return predict_fn
 
 
-# ---------------------------------------------------------------------------
-# Exact gradient computation via torch.autograd
-# ---------------------------------------------------------------------------
-
-def make_gradient_ame_fn(model) -> Callable:
-    """
-    Build an AME function using exact gradients from torch.autograd.
-
-    Replaces finite differences in core.py with exact gradients.
-    One autograd pass gives gradients for all features simultaneously.
-
-    For categorical features, falls back to first differences since
-    gradients with respect to discrete inputs are not meaningful.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        A fitted PyTorch model.
-
-    Returns
-    -------
-    Callable
-        gradient_ame_fn(X, feature_idx, is_categorical, h) -> np.ndarray
-        Returns pointwise marginal effects for a single feature, shape (n_obs,)
-    """
-    import torch
-
-    def gradient_ame_fn(
-        X: np.ndarray,
-        feature_idx: int,
-        is_categorical: bool = False,
-        h: float = 1e-4,
-    ) -> np.ndarray:
-
-        model.eval()
-
-        # Categorical: first difference, no gradient needed
-        if is_categorical:
-            with torch.no_grad():
-                X_0 = X.copy()
-                X_1 = X.copy()
-                X_0[:, feature_idx] = 0.0
-                X_1[:, feature_idx] = 1.0
-
-                pred_0 = model(
-                    torch.tensor(X_0, dtype=torch.float32)
-                ).numpy()
-                pred_1 = model(
-                    torch.tensor(X_1, dtype=torch.float32)
-                ).numpy()
-
-                pred_0 = _squeeze_output(pred_0)
-                pred_1 = _squeeze_output(pred_1)
-
-                return pred_1 - pred_0
-
-        # Continuous: exact gradient via autograd
-        X_tensor = torch.tensor(X, dtype=torch.float32, requires_grad=True)
-
-        output = model(X_tensor)
-        output = _squeeze_output_tensor(output)
-
-        # Sum over observations to get scalar for backward pass
-        # Gradient of sum(output) w.r.t. X gives dy_i/dx_i per row
-        grad_outputs = torch.ones_like(output)
-        grads = torch.autograd.grad(
-            outputs=output,
-            inputs=X_tensor,
-            grad_outputs=grad_outputs,
-            create_graph=False,
-            retain_graph=False,
-        )[0]
-
-        # Return gradient for requested feature only, shape (n_obs,)
-        return grads[:, feature_idx].detach().numpy()
-
-    return gradient_ame_fn
-
-
 def _squeeze_output(output_np: np.ndarray) -> np.ndarray:
     """Squeeze model output to 1D numpy array."""
     if output_np.ndim == 2 and output_np.shape[1] == 1:
@@ -292,9 +213,13 @@ def get_engine(
     loss_fn=None,
     n_epochs: int = 10,
     batch_size: int = 32,
-) -> Tuple[Callable, Callable, Callable]:
+) -> Tuple[Callable, Callable]:
     """
-    Get predict_fn, fit_fn, and gradient_ame_fn for a PyTorch model.
+    Get predict_fn and fit_fn for a PyTorch model.
+
+    Used by the bootstrap diagnostic path, which warm-starts from an already
+    fitted model. Cross-fitting uses learner.Learner instead, which trains
+    each fold from scratch.
 
     Parameters
     ----------
@@ -314,8 +239,8 @@ def get_engine(
 
     Returns
     -------
-    Tuple[Callable, Callable, Callable]
-        (predict_fn, fit_fn, gradient_ame_fn)
+    Tuple[Callable, Callable]
+        (predict_fn, fit_fn)
 
         predict_fn(X) -> np.ndarray
             Standard predictions in eval mode.
@@ -323,27 +248,21 @@ def get_engine(
         fit_fn(model, X_boot, y_boot) -> fitted_model
             Warm-start refit on bootstrap sample.
 
-        gradient_ame_fn(X, feature_idx, is_categorical, h) -> np.ndarray
-            Exact pointwise marginal effects via torch.autograd.
-
     Examples
     --------
     >>> import torch
     >>> import torch.nn as nn
-    >>> from engines.pytorch import get_engine
-    >>> from bootstrap import bootstrap_ames
+    >>> from marginfx.engines.pytorch import get_engine
+    >>> from marginfx.bootstrap import bootstrap_diagnostic
     >>>
     >>> model = MyNet()  # your fitted torch.nn.Module
-    >>> predict_fn, fit_fn, gradient_ame_fn = get_engine(
+    >>> predict_fn, fit_fn = get_engine(
     ...     model,
     ...     optimizer_fn=lambda p: torch.optim.Adam(p, lr=1e-3),
     ...     loss_fn=nn.BCELoss(),
     ...     n_epochs=10,
     ... )
-    >>> result = bootstrap_ames(
-    ...     model, X, y, fit_fn, predict_fn,
-    ...     gradient_ame_fn=gradient_ame_fn
-    ... )
+    >>> result = bootstrap_diagnostic(model, X, y, fit_fn, predict_fn)
     >>> result.summary()
     """
     predict_fn = make_predict_fn(model)
@@ -354,6 +273,5 @@ def get_engine(
         n_epochs=n_epochs,
         batch_size=batch_size,
     )
-    gradient_ame_fn = make_gradient_ame_fn(model)
 
-    return predict_fn, fit_fn, gradient_ame_fn
+    return predict_fn, fit_fn

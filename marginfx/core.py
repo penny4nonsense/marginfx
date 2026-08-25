@@ -1,35 +1,53 @@
 """
 core.py
 -------
-Model-agnostic computation of marginal effects and average marginal effects (AMEs).
+Model-agnostic computation of window average marginal effects.
 
 This module knows nothing about specific model types. It receives a predict_fn
 callable from the engine layer and operates purely on numpy arrays.
 
-Hierarchy:
-    me_at_point()       -> marginal effect at a single observation, single feature
-    marginal_effects()  -> marginal effect at all observations, single feature (vector)
-    ame()               -> average marginal effect, single feature (scalar)
-    all_ames()          -> average marginal effect for all features (dict)
+Estimand
+--------
+The target is the *window average marginal effect* at scale h (Definition 1 of
+the paper):
 
-Step size (h):
-    By default, all_ames() uses adaptive h computed as:
-        h_j = max(1e-4, 0.05 * std(X[:, j]))
+    theta_{j,h} = E[ w(X) * (f(X + h e_j) - f(X - h e_j)) / (2h) ]
 
-    For integer-valued features, an additional floor of 0.5 is applied:
-        h_j = max(h_j, 0.5)  if feature takes only integer values
+where w is a trimming weight supported on
 
-    This ensures the finite difference step is meaningful relative to each
-    feature's natural scale — critical for tree-based models (XGBoost, random
-    forests) where predictions are piecewise constant and a fixed small h may
-    never cross a split threshold. The integer floor ensures features like
-    education (1-16) and age in whole years reliably cross split boundaries.
+    Omega_{j,h} = { x : x + h e_j in Omega and x - h e_j in Omega }
 
-    For smooth models (logistic regression, neural nets), the true derivative
-    is recovered regardless of h as long as h is reasonably small.
+Two consequences of this definition drive the code below.
 
-    To use a fixed h for all features, pass h=0.01 (or any float) to all_ames().
-    me_at_point(), marginal_effects(), and ame() always take a fixed scalar h.
+1.  h is part of the estimand, not a numerical tolerance. The centered
+    difference is the *defining operation* of the target, computed exactly --
+    not an O(h^2) approximation to a derivative. h must therefore be chosen,
+    held fixed, and reported. It is recorded on MarginfxResult and printed by
+    summary().
+
+2.  Trimming is mandatory by default. Points within h_j of the boundary of the
+    observed support would require evaluating f at x_ij +/- h_j outside the
+    support, where the regression function is not identified. Those points get
+    weight zero. The trimmed shell carries probability mass O(h_j).
+
+theta_{j,h} converges to the classical average marginal effect E[df/dx_j] as
+h -> 0 whenever f has one weak derivative.
+
+Step size (h)
+-------------
+Default is 'adaptive':
+
+    h_j = max(1e-4, 0.05 * std(X[:, j]))
+
+The floor of 1e-4 guards against degenerate features with std ~ 0. With the
+default multiplier, h_j asks how the prediction responds to a displacement of
+a twentieth of a standard deviation.
+
+Note there is deliberately NO integer floor. An earlier version of this module
+applied h_j = max(h_j, 0.5) to integer-valued features so that finite
+differences would cross tree split thresholds. Under the window estimand that
+is not a numerical convenience but a silent redefinition of the target, so it
+has been removed.
 """
 
 import numpy as np
@@ -38,30 +56,14 @@ from typing import Callable, Optional, Union
 
 
 # ---------------------------------------------------------------------------
-# Adaptive step size
+# Step size
 # ---------------------------------------------------------------------------
 
-def _compute_adaptive_h(X: np.ndarray) -> np.ndarray:
+def compute_adaptive_h(X: np.ndarray) -> np.ndarray:
     """
-    Compute per-feature adaptive step sizes for finite differences.
+    Compute per-feature adaptive step sizes.
 
-    Formula:
         h_j = max(1e-4, 0.05 * std(X[:, j]))
-
-    For integer-valued features (e.g. education_num, age in whole years),
-    an additional floor of 0.5 is applied to ensure the nudge reliably
-    crosses tree split thresholds, which occur at integer boundaries:
-        h_j = max(h_j, 0.5)  if feature takes only integer values
-
-    This scales the step size to each feature's natural variation:
-        - Integer features (e.g. education 1-16):    h = max(0.05*std, 0.5)
-        - Unscaled features (e.g. age SD≈13):        h ≈ 0.685
-        - Standardized features (SD=1):              h ≈ 0.05
-        - Large-scale features (capital_gain SD≈7k): h ≈ 360
-
-    For tree-based models, h must be large enough to cross split thresholds.
-    For smooth models, the derivative is recovered accurately for any
-    reasonable h.
 
     Parameters
     ----------
@@ -74,230 +76,369 @@ def _compute_adaptive_h(X: np.ndarray) -> np.ndarray:
         Per-feature step sizes, shape (n_features,).
     """
     stds = np.std(X, axis=0)
-    h = np.maximum(1e-4, 0.05 * stds)
-
-    # For integer-valued features, ensure h >= 0.5 so finite differences
-    # reliably cross split thresholds at integer boundaries
-    for j in range(X.shape[1]):
-        unique_vals = np.unique(X[:, j])
-        if len(unique_vals) > 1 and np.all(unique_vals == unique_vals.astype(int)):
-            h[j] = max(h[j], 0.5)
-
-    return h
+    return np.maximum(1e-4, 0.05 * stds)
 
 
-# ---------------------------------------------------------------------------
-# Core finite difference computation
-# ---------------------------------------------------------------------------
-
-def me_at_point(
-    x: np.ndarray,
-    feature_idx: int,
-    predict_fn: Callable,
-    h: float = 1e-4,
-    is_categorical: bool = False,
-) -> float:
+def resolve_h(X: np.ndarray, h: Union[float, str, np.ndarray]) -> np.ndarray:
     """
-    Compute the marginal effect of a single feature at a single observation.
-
-    For continuous features, uses a central finite difference approximation:
-        ME = (f(x + h) - f(x - h)) / (2h)
-
-    For categorical (binary) features, uses a first difference:
-        ME = f(x | feature=1) - f(x | feature=0)
-
-    Parameters
-    ----------
-    x : np.ndarray
-        A single observation, shape (n_features,).
-    feature_idx : int
-        Index of the feature to compute the marginal effect for.
-    predict_fn : Callable
-        A function that takes an array of shape (n_obs, n_features) and returns
-        predictions of shape (n_obs,). Provided by the engine layer.
-    h : float
-        Step size for finite difference approximation. Default 1e-4.
-        For tree models, consider using a larger value. See _compute_adaptive_h.
-    is_categorical : bool
-        If True, computes a first difference (0 -> 1) instead of a derivative.
-
-    Returns
-    -------
-    float
-        The marginal effect at the given point.
-    """
-    x = np.array(x, dtype=float)
-
-    if is_categorical:
-        x_0 = x.copy()
-        x_1 = x.copy()
-        x_0[feature_idx] = 0.0
-        x_1[feature_idx] = 1.0
-        pred_0 = predict_fn(x_0.reshape(1, -1))[0]
-        pred_1 = predict_fn(x_1.reshape(1, -1))[0]
-        return float(pred_1 - pred_0)
-    else:
-        x_plus = x.copy()
-        x_minus = x.copy()
-        x_plus[feature_idx] += h
-        x_minus[feature_idx] -= h
-        pred_plus = predict_fn(x_plus.reshape(1, -1))[0]
-        pred_minus = predict_fn(x_minus.reshape(1, -1))[0]
-        return float((pred_plus - pred_minus) / (2 * h))
-
-
-# ---------------------------------------------------------------------------
-# Vectorized over dataset
-# ---------------------------------------------------------------------------
-
-def marginal_effects(
-    X: np.ndarray,
-    feature_idx: int,
-    predict_fn: Callable,
-    h: float = 1e-4,
-    is_categorical: bool = False,
-) -> np.ndarray:
-    """
-    Compute the marginal effect of a single feature at every observation in X.
+    Normalize the `h` argument to a per-feature array.
 
     Parameters
     ----------
     X : np.ndarray
-        Dataset of shape (n_obs, n_features).
-    feature_idx : int
-        Index of the feature to compute marginal effects for.
-    predict_fn : Callable
-        A function that takes (n_obs, n_features) and returns (n_obs,).
-    h : float
-        Step size for finite difference approximation.
-    is_categorical : bool
-        If True, computes first differences instead of derivatives.
+        Feature matrix, shape (n_obs, n_features).
+    h : float, 'adaptive', or np.ndarray
+        Step size specification. 'adaptive' uses compute_adaptive_h.
 
     Returns
     -------
     np.ndarray
-        Array of marginal effects, shape (n_obs,).
+        Per-feature step sizes, shape (n_features,).
     """
-    X = np.array(X, dtype=float)
-
-    if is_categorical:
-        X_0 = X.copy()
-        X_1 = X.copy()
-        X_0[:, feature_idx] = 0.0
-        X_1[:, feature_idx] = 1.0
-        return predict_fn(X_1) - predict_fn(X_0)
-    else:
-        X_plus = X.copy()
-        X_minus = X.copy()
-        X_plus[:, feature_idx] += h
-        X_minus[:, feature_idx] -= h
-        return (predict_fn(X_plus) - predict_fn(X_minus)) / (2 * h)
+    n_features = X.shape[1]
+    if isinstance(h, str):
+        if h != 'adaptive':
+            raise ValueError(f"h must be a float, an array, or 'adaptive'; got {h!r}")
+        return compute_adaptive_h(X)
+    h_arr = np.asarray(h, dtype=float)
+    if h_arr.ndim == 0:
+        return np.full(n_features, float(h_arr))
+    if h_arr.shape != (n_features,):
+        raise ValueError(
+            f"h array has shape {h_arr.shape}, expected ({n_features},)"
+        )
+    return h_arr
 
 
 # ---------------------------------------------------------------------------
-# Average marginal effect — single feature
+# Support bounds and trimming
 # ---------------------------------------------------------------------------
 
-def ame(
+def support_bounds(X: np.ndarray) -> tuple:
+    """
+    Per-feature bounds of the observed support.
+
+    These define the empirical analog of Omega. They must be computed once on
+    the full sample and then held fixed -- the trimming weight is part of the
+    estimand, so it cannot be allowed to vary across folds or bootstrap
+    replicates.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix, shape (n_obs, n_features).
+
+    Returns
+    -------
+    tuple of np.ndarray
+        (lower, upper), each of shape (n_features,).
+    """
+    return np.min(X, axis=0), np.max(X, axis=0)
+
+
+def trimming_weight(
+    X: np.ndarray,
+    feature_idx: int,
+    h: float,
+    bounds: Optional[tuple] = None,
+) -> np.ndarray:
+    """
+    Trimming weight w for a single feature.
+
+    Returns 1.0 for observations whose both shifted evaluation points stay
+    inside the observed support of feature j, and 0.0 otherwise:
+
+        w_i = 1{ x_ij + h <= upper_j  and  x_ij - h >= lower_j }
+
+    This is the indicator of Omega_{j,h}. Without it, f is evaluated outside
+    the support, where the regression function is unidentified and the fitted
+    model is silently extrapolating.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix, shape (n_obs, n_features).
+    feature_idx : int
+        Index of the feature being perturbed.
+    h : float
+        Step size for this feature.
+    bounds : tuple of np.ndarray, optional
+        (lower, upper) from support_bounds(). If None, computed from X.
+        Pass explicitly when X is a subsample, so that the estimand does not
+        drift with the subsample.
+
+    Returns
+    -------
+    np.ndarray
+        Weights in {0.0, 1.0}, shape (n_obs,).
+    """
+    if bounds is None:
+        bounds = support_bounds(X)
+    lower, upper = bounds
+    xj = X[:, feature_idx]
+    inside = (xj + h <= upper[feature_idx]) & (xj - h >= lower[feature_idx])
+    return inside.astype(float)
+
+
+# ---------------------------------------------------------------------------
+# The difference operator
+# ---------------------------------------------------------------------------
+
+def window_difference(
     X: np.ndarray,
     feature_idx: int,
     predict_fn: Callable,
-    h: float = 1e-4,
-    is_categorical: bool = False,
-) -> float:
+    h: float,
+) -> np.ndarray:
     """
-    Compute the average marginal effect (AME) of a single feature.
+    Centered difference operator D_h applied to the prediction function.
 
-    The AME is the mean of the pointwise marginal effects across all observations.
-    This is the scalar quantity analogous to an OLS coefficient.
+        D_h f(x_i) = (f(x_i + h e_j) - f(x_i - h e_j)) / (2h)
 
     Parameters
     ----------
     X : np.ndarray
         Dataset of shape (n_obs, n_features).
     feature_idx : int
-        Index of the feature.
+        Index of the feature to perturb.
     predict_fn : Callable
-        Prediction function from the engine layer.
+        Takes (n_obs, n_features), returns (n_obs,). For binary
+        classification this must return P(Y=1 | x), not a class label --
+        class labels are discrete and their differences are identically zero.
     h : float
-        Step size for finite differences.
+        Step size.
+
+    Returns
+    -------
+    np.ndarray
+        Difference at each observation, shape (n_obs,).
+    """
+    X_plus = X.copy()
+    X_minus = X.copy()
+    X_plus[:, feature_idx] += h
+    X_minus[:, feature_idx] -= h
+    return (predict_fn(X_plus) - predict_fn(X_minus)) / (2.0 * h)
+
+
+def contrast(
+    X: np.ndarray,
+    feature_idx: int,
+    predict_fn: Callable,
+) -> np.ndarray:
+    """
+    First difference for a binary or categorical feature.
+
+        m_ij = f(x_i | x_j = 1) - f(x_i | x_j = 0)
+
+    No step size and no trimming apply: the perturbation is between two levels
+    that both lie in the support by construction.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Dataset of shape (n_obs, n_features).
+    feature_idx : int
+        Index of the binary feature.
+    predict_fn : Callable
+        Takes (n_obs, n_features), returns (n_obs,).
+
+    Returns
+    -------
+    np.ndarray
+        Contrast at each observation, shape (n_obs,).
+    """
+    X_0 = X.copy()
+    X_1 = X.copy()
+    X_0[:, feature_idx] = 0.0
+    X_1[:, feature_idx] = 1.0
+    return predict_fn(X_1) - predict_fn(X_0)
+
+
+def pointwise_effects(
+    X: np.ndarray,
+    feature_idx: int,
+    predict_fn: Callable,
+    h: float,
+    is_categorical: bool = False,
+    weights: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Weighted pointwise effect for one feature -- the summand of the plug-in.
+
+    Continuous: w_i * D_h f(x_i).  Categorical: the contrast (w_i == 1).
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Dataset of shape (n_obs, n_features).
+    feature_idx : int
+        Feature index.
+    predict_fn : Callable
+        Prediction function.
+    h : float
+        Step size. Ignored when is_categorical is True.
     is_categorical : bool
-        If True, computes first differences.
+        If True, use the contrast instead of the difference operator.
+    weights : np.ndarray, optional
+        Trimming weights, shape (n_obs,). Defaults to all ones.
+
+    Returns
+    -------
+    np.ndarray
+        Weighted effects, shape (n_obs,).
+    """
+    if is_categorical:
+        return contrast(X, feature_idx, predict_fn)
+
+    effects = window_difference(X, feature_idx, predict_fn, h)
+    if weights is None:
+        return effects
+    return weights * effects
+
+
+# ---------------------------------------------------------------------------
+# Plug-in estimator
+# ---------------------------------------------------------------------------
+
+def plugin_ame(
+    X: np.ndarray,
+    feature_idx: int,
+    predict_fn: Callable,
+    h: float,
+    is_categorical: bool = False,
+    weights: Optional[np.ndarray] = None,
+) -> float:
+    """
+    Plug-in estimate of the window AME for a single feature.
+
+        theta_hat = (1/n) sum_i w_i * D_h f(x_i)
+
+    Note the average is over all n observations, NOT renormalized by sum(w).
+    theta_{j,h} is defined as E[w(X) D_h f(X)], so renormalizing would target a
+    different functional (the effect conditional on being untrimmed).
+
+    This estimator is biased by the learner's regularization; see dml.py for
+    the debiased version that the paper uses for inference.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Dataset of shape (n_obs, n_features).
+    feature_idx : int
+        Feature index.
+    predict_fn : Callable
+        Prediction function.
+    h : float
+        Step size.
+    is_categorical : bool
+        If True, use the contrast.
+    weights : np.ndarray, optional
+        Trimming weights.
 
     Returns
     -------
     float
-        The average marginal effect.
+        The plug-in window average marginal effect.
     """
-    me_vector = marginal_effects(X, feature_idx, predict_fn, h, is_categorical)
-    return float(np.mean(me_vector))
+    return float(np.mean(
+        pointwise_effects(X, feature_idx, predict_fn, h, is_categorical, weights)
+    ))
 
 
-# ---------------------------------------------------------------------------
-# Average marginal effects — all features
-# ---------------------------------------------------------------------------
+def resolve_categorical(
+    categorical_features: Optional[list],
+    feature_names: list,
+) -> set:
+    """
+    Normalize a list of categorical feature names/indices to a set of indices.
 
-def all_ames(
+    Parameters
+    ----------
+    categorical_features : list or None
+        Feature names or integer indices.
+    feature_names : list of str
+        Ordered feature names.
+
+    Returns
+    -------
+    set of int
+        Indices of categorical features.
+    """
+    if not categorical_features:
+        return set()
+
+    indices = set()
+    for cf in categorical_features:
+        if isinstance(cf, str):
+            if cf not in feature_names:
+                raise ValueError(f"Unknown categorical feature name: {cf!r}")
+            indices.add(feature_names.index(cf))
+        elif isinstance(cf, (int, np.integer)):
+            indices.add(int(cf))
+        else:
+            raise TypeError(
+                f"categorical_features entries must be str or int; got {type(cf)}"
+            )
+    return indices
+
+
+def plugin_ames(
     X: np.ndarray,
     predict_fn: Callable,
     feature_names: Optional[list] = None,
     categorical_features: Optional[list] = None,
-    h: Union[float, str] = 'adaptive',
+    h: Union[float, str, np.ndarray] = 'adaptive',
+    trim: bool = True,
+    bounds: Optional[tuple] = None,
 ) -> dict:
     """
-    Compute average marginal effects for all features.
+    Plug-in window AMEs for all features.
 
     Parameters
     ----------
     X : np.ndarray
         Dataset of shape (n_obs, n_features).
     predict_fn : Callable
-        Prediction function from the engine layer.
+        Prediction function.
     feature_names : list, optional
-        Names for each feature. Defaults to ['x0', 'x1', ...].
+        Defaults to ['x0', 'x1', ...].
     categorical_features : list, optional
-        List of feature indices (or names) that are categorical/binary.
-        These will use first differences instead of derivatives.
-    h : float or 'adaptive'
-        Step size for finite differences. Default 'adaptive' computes
-        h_j = max(1e-4, 0.05 * std(X[:, j])) per feature, with an
-        additional floor of 0.5 for integer-valued features.
-        Pass a float to use a fixed step size for all features.
+        Names or indices of binary/categorical features.
+    h : float, 'adaptive', or np.ndarray
+        Step size specification.
+    trim : bool
+        Apply the trimming weight. Default True. Set False only when the
+        covariate support is unbounded (e.g. Gaussian simulation designs),
+        where Omega_{j,h} is all of R^d and w == 1 identically.
+    bounds : tuple, optional
+        (lower, upper) support bounds. If None, computed from X.
 
     Returns
     -------
     dict
-        Dictionary mapping feature name -> AME estimate.
+        Feature name -> plug-in window AME.
     """
-    X = np.array(X, dtype=float)
+    X = np.asarray(X, dtype=float)
     n_features = X.shape[1]
 
     if feature_names is None:
         feature_names = [f"x{i}" for i in range(n_features)]
 
-    if categorical_features is None:
-        categorical_features = []
-
-    # Normalize categorical_features to indices
-    cat_indices = set()
-    for cf in categorical_features:
-        if isinstance(cf, str):
-            if cf in feature_names:
-                cat_indices.add(feature_names.index(cf))
-        elif isinstance(cf, int):
-            cat_indices.add(cf)
-
-    # Compute adaptive h per feature or use fixed scalar
-    if h == 'adaptive':
-        h_values = _compute_adaptive_h(X)
-    else:
-        h_values = np.full(n_features, float(h))
+    cat_indices = resolve_categorical(categorical_features, feature_names)
+    h_values = resolve_h(X, h)
+    if trim and bounds is None:
+        bounds = support_bounds(X)
 
     results = {}
     for idx, name in enumerate(feature_names):
         is_cat = idx in cat_indices
-        results[name] = ame(X, idx, predict_fn, h_values[idx], is_cat)
-
+        if is_cat or not trim:
+            weights = None
+        else:
+            weights = trimming_weight(X, idx, h_values[idx], bounds)
+        results[name] = plugin_ame(
+            X, idx, predict_fn, h_values[idx], is_cat, weights
+        )
     return results
 
 
@@ -309,24 +450,34 @@ class MarginfxResult:
     """
     Container for marginfx estimation results.
 
-    Holds AME estimates and optionally standard errors and confidence intervals
-    from the bootstrap. Provides tidy DataFrame output and a summary table
-    analogous to the broom package in R.
-
     Attributes
     ----------
     estimates : dict
-        Feature name -> AME estimate.
+        Feature name -> window AME estimate.
     std_errors : dict or None
-        Feature name -> bootstrap standard error.
+        Feature name -> standard error.
     conf_int : dict or None
-        Feature name -> (lower, upper) confidence interval tuple.
+        Feature name -> (lower, upper) pointwise interval.
+    simultaneous_conf_int : dict or None
+        Feature name -> (lower, upper) band holding simultaneously across all
+        features, from the multiplier bootstrap.
     n_obs : int
-        Number of observations used.
+        Number of observations.
+    method : str
+        'debiased' for the cross-fitted influence-function estimator,
+        'bootstrap-diagnostic' for the refitting bootstrap.
+    h : dict or None
+        Feature name -> step size used. Part of the estimand, so it is
+        reported alongside the estimates.
+    trimmed_fraction : dict or None
+        Feature name -> fraction of observations receiving trimming weight
+        zero.
+    n_folds : int or None
+        Cross-fitting folds, for the debiased estimator.
     n_bootstrap : int or None
-        Number of bootstrap replicates used.
+        Bootstrap replicates, for the diagnostic.
     alpha : float
-        Significance level for confidence intervals. Default 0.05.
+        Significance level. Default 0.05.
     """
 
     def __init__(
@@ -335,68 +486,102 @@ class MarginfxResult:
         std_errors: Optional[dict] = None,
         conf_int: Optional[dict] = None,
         n_obs: int = 0,
+        method: str = 'debiased',
+        h: Optional[dict] = None,
+        trimmed_fraction: Optional[dict] = None,
+        n_folds: Optional[int] = None,
         n_bootstrap: Optional[int] = None,
         alpha: float = 0.05,
+        influence: Optional[dict] = None,
+        simultaneous_conf_int: Optional[dict] = None,
     ):
         self.estimates = estimates
         self.std_errors = std_errors
         self.conf_int = conf_int
         self.n_obs = n_obs
+        self.method = method
+        self.h = h
+        self.trimmed_fraction = trimmed_fraction
+        self.n_folds = n_folds
         self.n_bootstrap = n_bootstrap
         self.alpha = alpha
+        self.influence = influence
+        self.simultaneous_conf_int = simultaneous_conf_int
 
     def tidy(self) -> pd.DataFrame:
         """
-        Return results as a tidy DataFrame, analogous to broom::tidy() in R.
+        Return results as a tidy DataFrame.
 
         Returns
         -------
         pd.DataFrame
-            Columns: term, estimate, std_error, statistic, p_value,
-                     conf_low, conf_high (last four only if bootstrap was run).
+            Columns: term, estimate, h, std_error, statistic, p_value,
+            conf_low, conf_high, trimmed. Inference columns are present only
+            when standard errors were computed.
         """
+        from scipy import stats
+
         rows = []
         for feature, est in self.estimates.items():
             row = {"term": feature, "estimate": est}
 
+            if self.h and feature in self.h:
+                row["h"] = self.h[feature]
+
             if self.std_errors and feature in self.std_errors:
                 se = self.std_errors[feature]
                 row["std_error"] = se
-                row["statistic"] = est / se if se > 0 else np.nan
-                # Normal approximation p-value (two-tailed)
-                from scipy import stats
-                row["p_value"] = 2 * (1 - stats.norm.cdf(abs(row["statistic"])))
+                stat = est / se if se > 0 else np.nan
+                row["statistic"] = stat
+                row["p_value"] = (
+                    2.0 * (1.0 - stats.norm.cdf(abs(stat)))
+                    if np.isfinite(stat) else np.nan
+                )
 
             if self.conf_int and feature in self.conf_int:
                 row["conf_low"] = self.conf_int[feature][0]
                 row["conf_high"] = self.conf_int[feature][1]
+
+            if (self.simultaneous_conf_int
+                    and feature in self.simultaneous_conf_int):
+                row["simul_low"] = self.simultaneous_conf_int[feature][0]
+                row["simul_high"] = self.simultaneous_conf_int[feature][1]
+
+            if self.trimmed_fraction and feature in self.trimmed_fraction:
+                row["trimmed"] = self.trimmed_fraction[feature]
 
             rows.append(row)
 
         return pd.DataFrame(rows)
 
     def summary(self) -> None:
-        """
-        Print a formatted summary table to stdout.
-        """
+        """Print a formatted coefficient table to stdout."""
         df = self.tidy()
-        print("=" * 65)
-        print("marginfx: Average Marginal Effects")
-        print("=" * 65)
+        width = 88
+        print("=" * width)
+        print("marginfx: Window Average Marginal Effects")
+        print("=" * width)
         print(f"Observations: {self.n_obs}")
-        if self.n_bootstrap:
-            print(f"Bootstrap replicates: {self.n_bootstrap}")
+
+        if self.method == 'debiased':
+            print(f"Estimator: debiased cross-fitted (K={self.n_folds})")
+            print("Standard errors: influence function")
+        elif self.method == 'bootstrap-diagnostic':
+            print(f"Estimator: plug-in, refitting bootstrap "
+                  f"(B={self.n_bootstrap})")
+            print("WARNING: diagnostic only -- these standard errors are not")
+            print("         valid for inference. See bootstrap.py.")
+
+        if self.std_errors:
             print(f"Confidence level: {int((1 - self.alpha) * 100)}%")
-        print("-" * 65)
+        print("-" * width)
         print(df.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
-        print("=" * 65)
+        print("=" * width)
 
     def __repr__(self) -> str:
-        n = len(self.estimates)
-        has_se = self.std_errors is not None
         return (
             f"MarginfxResult("
-            f"features={n}, "
-            f"bootstrap={'yes' if has_se else 'no'}, "
+            f"features={len(self.estimates)}, "
+            f"method={self.method!r}, "
             f"n_obs={self.n_obs})"
         )

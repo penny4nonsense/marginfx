@@ -1,45 +1,62 @@
 """
 bootstrap.py
 ------------
-Nonparametric bootstrap for computing standard errors and confidence intervals
-on average marginal effects (AMEs).
+Refitting bootstrap -- retained as a DIAGNOSTIC, not as an inference procedure.
 
-Design:
-    - Fully nonparametric — no distributional assumptions
-    - AMEs computed on the bootstrap sample (not the original X)
-    - Warm-start from the original fitted model for computational efficiency
-    - Standard errors from SD of bootstrap distribution
-    - Confidence intervals from percentiles of bootstrap distribution
+What this measures
+------------------
+Resampling (x_i, y_i) pairs jointly, refitting the learner on each replicate,
+and recomputing the plug-in window AME measures how sensitive the reported
+effects are to the joint variability of resampling, refitting, and
+hyperparameter selection. Large dispersion is a useful warning that the fitted
+model is unstable.
 
-The engine layer provides two callables:
-    fit_fn(model, X, y) -> fitted_model
-        Refits the model on a new dataset, warm-starting from the original.
-    predict_fn(X) -> np.ndarray
-        Returns predictions of shape (n_obs,). Already bound to the model
-        by the engine layer — takes only X as argument.
+What this does NOT measure
+--------------------------
+It is not a substitute for the influence-function standard errors in dml.py,
+for two reasons the paper makes precise.
 
-Step size (h):
-    Default is 'adaptive', which computes h_j = max(1e-4, 0.05 * std(X[:, j]))
-    per feature on the bootstrap sample, with an additional floor of 0.5 for
-    integer-valued features. This ensures finite differences are meaningful
-    relative to each feature's natural scale across all model types.
+1.  It recenters at the fitted model, and is therefore blind to the
+    regularization bias that the orthogonal correction removes. Every replicate
+    recenters at a similarly regularized fit, so resampling cannot see the bias
+    term E[alpha_h (f_hat - f)]. The intervals shrink at the right rate around
+    a displaced point. In the paper's simulations this produces random forest
+    coverage collapsing to roughly 0.10-0.13 at n = 5,000 -- the interval ends
+    up about the width of the bias itself. The failure is not specific to
+    forests but to any learner whose L^2 bias shrinks more slowly than its
+    intervals.
 
-    Importantly, adaptive h is recomputed on each bootstrap sample — so the
-    step size naturally reflects the scale of the resampled data, which is
-    essentially identical to the original data for large n.
+2.  Because each replicate is evaluated at the original sample D, it omits the
+    component of sampling variance that comes from averaging a heterogeneous
+    effect over a finite sample of covariate values.
 
-Short-circuit:
-    Pass n_bootstrap=0 to compute point estimates only with no standard errors.
-    This is useful for simulation studies where only AME recovery is measured.
+Evaluation point
+----------------
+Replicate effects are computed with f_hat^(b) evaluated at the ORIGINAL sample
+D, not at the bootstrap sample D^(b). This follows standard practice for smooth
+functionals of the empirical distribution and makes the replicate depend on the
+draw only through f_hat^(b). It is also the choice the paper analyzes.
+
+Consequently h and the trimming weight are computed once on the original
+sample and held fixed -- they define the estimand, so they must not be
+recomputed per replicate.
 """
 
 import numpy as np
-from typing import Callable, Optional, List, Union
-from .core import all_ames, MarginfxResult
+from typing import Callable, List, Optional, Union
+
+from .core import (
+    MarginfxResult,
+    plugin_ames,
+    resolve_categorical,
+    resolve_h,
+    support_bounds,
+    trimming_weight,
+)
 
 
 # ---------------------------------------------------------------------------
-# Single bootstrap replicate
+# Single replicate
 # ---------------------------------------------------------------------------
 
 def _bootstrap_replicate(
@@ -47,82 +64,83 @@ def _bootstrap_replicate(
     X: np.ndarray,
     y: np.ndarray,
     fit_fn: Callable,
-    feature_names: Optional[List[str]],
+    feature_names: List[str],
     categorical_features: Optional[list],
-    h: Union[float, str],
+    h_values: np.ndarray,
+    trim: bool,
+    bounds: tuple,
     rng: np.random.Generator,
 ) -> dict:
     """
     Run a single bootstrap replicate.
 
-    Resamples the data, refits the model warm-starting from the original,
-    and computes AMEs on the bootstrap sample.
+    Resamples (x_i, y_i) pairs jointly with replacement, refits the model
+    warm-starting from the original, and recomputes the plug-in window AMEs
+    at the ORIGINAL sample X.
 
     Parameters
     ----------
-    model : fitted model object
-        The original fitted model. Used as warm-start initialization.
+    model : fitted model
+        Original fitted model, used as the warm start.
     X : np.ndarray
         Original feature matrix, shape (n_obs, n_features).
     y : np.ndarray
         Original target vector, shape (n_obs,).
     fit_fn : Callable
-        Function with signature fit_fn(model, X_boot, y_boot) -> fitted_model.
-        The engine provides this. It should warm-start from model.
-    feature_names : list or None
-        Feature names passed through to all_ames().
+        fit_fn(model, X_boot, y_boot) -> fitted_model, from the engine layer.
+    feature_names : list of str
+        Feature names.
     categorical_features : list or None
-        Categorical feature indices or names passed through to all_ames()
-    h : float or 'adaptive'
-        Step size for finite differences. Passed through to all_ames().
-        When 'adaptive', h is computed from the bootstrap sample itself.
+        Categorical feature names or indices.
+    h_values : np.ndarray
+        Per-feature step sizes, fixed from the original sample.
+    trim : bool
+        Whether to apply the trimming weight.
+    bounds : tuple
+        (lower, upper) support bounds from the original sample.
     rng : np.random.Generator
-        Random number generator for reproducibility.
+        Randomness source.
 
     Returns
     -------
     dict
-        Feature name -> AME estimate for this replicate.
+        Feature name -> replicate plug-in window AME.
     """
     n = X.shape[0]
 
-    # Resample with replacement
     indices = rng.integers(0, n, size=n)
-    X_boot = X[indices]
-    y_boot = y[indices]
+    fitted = fit_fn(model, X[indices], y[indices])
 
-    # Refit model warm-starting from original
-    fitted = fit_fn(model, X_boot, y_boot)
-
-    # Build a predict_fn bound to the newly fitted replicate model.
-    # Autodetect the right prediction method from the fitted model.
     if hasattr(fitted, 'predict_proba'):
         def replicate_predict_fn(X_input):
-            return fitted.predict_proba(X_input)[:, 1]
+            proba = fitted.predict_proba(X_input)
+            if proba.ndim == 2 and proba.shape[1] == 2:
+                return proba[:, 1]
+            return proba
     elif hasattr(fitted, 'predict'):
         def replicate_predict_fn(X_input):
             return fitted.predict(X_input)
     else:
-        # TF/PyTorch: model is directly callable
         def replicate_predict_fn(X_input):
             return fitted(X_input)
 
-    # Compute AMEs on the bootstrap sample
-    # When h='adaptive', step sizes are computed from X_boot itself
-    return all_ames(
-        X=X_boot,
+    # Evaluated at the ORIGINAL sample X, with the estimand's fixed h and w.
+    return plugin_ames(
+        X=X,
         predict_fn=replicate_predict_fn,
         feature_names=feature_names,
         categorical_features=categorical_features,
-        h=h,
+        h=h_values,
+        trim=trim,
+        bounds=bounds,
     )
 
 
 # ---------------------------------------------------------------------------
-# Main bootstrap function
+# Main entry point
 # ---------------------------------------------------------------------------
 
-def bootstrap_ames(
+def bootstrap_diagnostic(
     model,
     X: np.ndarray,
     y: np.ndarray,
@@ -132,129 +150,129 @@ def bootstrap_ames(
     categorical_features: Optional[list] = None,
     n_bootstrap: int = 200,
     alpha: float = 0.05,
-    h: Union[float, str] = 'adaptive',
+    h: Union[float, str, np.ndarray] = 'adaptive',
+    trim: bool = True,
     seed: Optional[int] = None,
     verbose: bool = True,
 ) -> MarginfxResult:
     """
-    Compute AMEs with bootstrap standard errors and percentile confidence intervals.
+    Plug-in window AMEs with refitting-bootstrap dispersion, as a diagnostic.
 
-    Runs n_bootstrap replicates of:
-        1. Resample data with replacement
-        2. Warm-start refit from original model
-        3. Compute AMEs on bootstrap sample
-
-    Then aggregates across replicates to produce:
-        - Point estimates (AMEs on full original dataset)
-        - Standard errors (SD of bootstrap distribution)
-        - Confidence intervals (percentiles of bootstrap distribution)
+    The returned standard errors are NOT valid for inference. Use
+    marginfx.fit() for that. See the module docstring for why.
 
     Parameters
     ----------
-    model : fitted model object
-        Original fitted model. Must be compatible with fit_fn and predict_fn.
+    model : fitted model
+        Original fitted model, compatible with fit_fn and predict_fn.
     X : np.ndarray
         Feature matrix, shape (n_obs, n_features).
     y : np.ndarray
         Target vector, shape (n_obs,).
     fit_fn : Callable
-        Engine-provided function: fit_fn(model, X_boot, y_boot) -> fitted_model.
-        Should warm-start from model.
+        fit_fn(model, X_boot, y_boot) -> fitted_model.
     predict_fn : Callable
-        Engine-provided function: predict_fn(X) -> np.ndarray.
-        Already bound to the original model — takes only X as argument.
-    feature_names : list, optional
-        Feature names. Defaults to ['x0', 'x1', ...].
+        predict_fn(X) -> np.ndarray, already bound to `model`.
+    feature_names : list of str, optional
+        Defaults to ['x0', 'x1', ...].
     categorical_features : list, optional
-        Indices or names of categorical/binary features.
+        Names or indices of binary features.
     n_bootstrap : int
-        Number of bootstrap replicates. Default 200.
-        Pass 0 to compute point estimates only with no standard errors.
-        Useful for simulation studies measuring AME recovery.
+        Replicates. Default 200. Pass 0 for point estimates only.
     alpha : float
-        Significance level. Default 0.05 gives 95% CIs.
-    h : float or 'adaptive'
-        Step size for finite differences. Default 'adaptive' computes
-        h_j = max(1e-4, 0.05 * std(X[:, j])) per feature, with an
-        additional floor of 0.5 for integer-valued features.
-        Pass a float to use a fixed step size for all features.
+        Significance level for the percentile intervals. Default 0.05.
+    h : float, 'adaptive', or np.ndarray
+        Step size. Computed once on the original sample and held fixed.
+    trim : bool
+        Apply the trimming weight. Default True.
     seed : int, optional
-        Random seed for reproducibility.
+        Random seed.
     verbose : bool
-        If True, prints progress every 10% of replicates.
+        Print progress every 10% of replicates.
 
     Returns
     -------
     MarginfxResult
-        Contains point estimates, and optionally standard errors and
-        confidence intervals if n_bootstrap > 0.
+        With method='bootstrap-diagnostic'.
     """
-    X = np.array(X, dtype=float)
-    y = np.array(y, dtype=float)
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
     n_obs, n_features = X.shape
 
     if feature_names is None:
         feature_names = [f"x{i}" for i in range(n_features)]
 
-    rng = np.random.default_rng(seed)
+    cat_indices = resolve_categorical(categorical_features, feature_names)
+    h_values = resolve_h(X, h)
+    bounds = support_bounds(X)
 
-    # --- Point estimates on full dataset ---
-    # predict_fn is already bound to the model — just pass X
-    point_estimates = all_ames(
+    h_report = {}
+    trimmed_fraction = {}
+    for j, name in enumerate(feature_names):
+        if j in cat_indices:
+            h_report[name] = float('nan')
+            trimmed_fraction[name] = 0.0
+        else:
+            h_report[name] = float(h_values[j])
+            w = (trimming_weight(X, j, h_values[j], bounds)
+                 if trim else np.ones(n_obs))
+            trimmed_fraction[name] = float(1.0 - w.mean())
+
+    point_estimates = plugin_ames(
         X=X,
         predict_fn=predict_fn,
         feature_names=feature_names,
         categorical_features=categorical_features,
-        h=h,
+        h=h_values,
+        trim=trim,
+        bounds=bounds,
     )
 
-    # --- Short-circuit if no bootstrap requested ---
     if n_bootstrap == 0:
         return MarginfxResult(
             estimates=point_estimates,
-            std_errors=None,
-            conf_int=None,
             n_obs=n_obs,
+            method='bootstrap-diagnostic',
+            h=h_report,
+            trimmed_fraction=trimmed_fraction,
             n_bootstrap=0,
             alpha=alpha,
         )
 
-    # --- Bootstrap replicates ---
-    # Store as dict of feature -> list of B AME estimates
-    bootstrap_distributions = {name: [] for name in feature_names}
-
+    rng = np.random.default_rng(seed)
+    distributions = {name: [] for name in feature_names}
     log_interval = max(1, n_bootstrap // 10)
 
     for b in range(n_bootstrap):
         if verbose and (b + 1) % log_interval == 0:
             print(f"  Bootstrap replicate {b + 1}/{n_bootstrap}...")
 
-        replicate_ames = _bootstrap_replicate(
+        replicate = _bootstrap_replicate(
             model=model,
             X=X,
             y=y,
             fit_fn=fit_fn,
             feature_names=feature_names,
             categorical_features=categorical_features,
-            h=h,
+            h_values=h_values,
+            trim=trim,
+            bounds=bounds,
             rng=rng,
         )
-
         for name in feature_names:
-            bootstrap_distributions[name].append(replicate_ames[name])
+            distributions[name].append(replicate[name])
 
-    # --- Aggregate bootstrap distributions ---
     std_errors = {}
     conf_int = {}
-    lower_pct = (alpha / 2) * 100
-    upper_pct = (1 - alpha / 2) * 100
+    lower_pct = (alpha / 2.0) * 100.0
+    upper_pct = (1.0 - alpha / 2.0) * 100.0
 
     for name in feature_names:
-        boot_dist = np.array(bootstrap_distributions[name])
-        std_errors[name] = float(np.std(boot_dist, ddof=1))
+        dist = np.asarray(distributions[name], dtype=float)
+        std_errors[name] = float(np.std(dist, ddof=1))
         conf_int[name] = (
-            float(np.percentile(boot_dist, lower_pct)),
-            float(np.percentile(boot_dist, upper_pct)),
+            float(np.percentile(dist, lower_pct)),
+            float(np.percentile(dist, upper_pct)),
         )
 
     return MarginfxResult(
@@ -262,6 +280,9 @@ def bootstrap_ames(
         std_errors=std_errors,
         conf_int=conf_int,
         n_obs=n_obs,
+        method='bootstrap-diagnostic',
+        h=h_report,
+        trimmed_fraction=trimmed_fraction,
         n_bootstrap=n_bootstrap,
         alpha=alpha,
     )
