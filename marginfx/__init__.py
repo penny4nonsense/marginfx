@@ -198,7 +198,9 @@ def fit(
         f(x|x_j=1) - f(x|x_j=0) with an inverse propensity representer.
     h : float, 'adaptive', or np.ndarray
         Step size defining the estimand. Default 'adaptive' gives
-        h_j = max(1e-4, 0.05 * std_j).
+        h_j = max(1e-4, 0.05 * std_j), floored at 0.5 for integer-valued
+        features so that a count is contrasted over a whole unit. The
+        resolved h is reported on the result.
     trim : bool
         Apply the trimming weight. Default True. Set False only when the
         covariate support is unbounded, e.g. Gaussian simulation designs.
@@ -385,4 +387,4 @@ __all__ = [
     'gaussian_window_riesz',
 ]
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'

@@ -60,8 +60,16 @@ The **trimming weight** `w` gives weight zero to observations within `h_j` of th
 Default step size:
 
 ```
-h_j = max(1e-4, 0.05 · σ̂_j)
+h_j = max(1e-4, 0.05 · σ̂_j),   floored at 0.5 if x_j takes only integer values
 ```
+
+`h` is part of the estimand, so the resolved value is reported back in
+`result.h` and in the `h` column of `tidy()`. The integer floor is there
+because a count feature has no mass strictly between its levels: a window
+narrower than one unit has an empty interior, and for a piecewise constant
+learner the difference across it is zero except where the window straddles a
+split. At `h = 0.5` the window is exactly the one-unit contrast. Pass `h`
+explicitly to override the default; the floor applies only to `'adaptive'`.
 
 For binary features the difference is replaced by the contrast `f(x | x_j=1) − f(x | x_j=0)`.
 

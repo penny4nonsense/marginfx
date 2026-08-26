@@ -39,15 +39,25 @@ Default is 'adaptive':
 
     h_j = max(1e-4, 0.05 * std(X[:, j]))
 
-The floor of 1e-4 guards against degenerate features with std ~ 0. With the
-default multiplier, h_j asks how the prediction responds to a displacement of
-a twentieth of a standard deviation.
+with a floor of 0.5 for integer-valued features. The floor of 1e-4 guards
+against degenerate features with std ~ 0. With the default multiplier, h_j
+asks how the prediction responds to a displacement of a twentieth of a
+standard deviation.
 
-Note there is deliberately NO integer floor. An earlier version of this module
-applied h_j = max(h_j, 0.5) to integer-valued features so that finite
-differences would cross tree split thresholds. Under the window estimand that
-is not a numerical convenience but a silent redefinition of the target, so it
-has been removed.
+h is part of the estimand, not a numerical tuning knob: theta_h is defined by
+the window, so changing h changes what is being estimated. That is why the
+resolved h is reported back on every result and appears as a column in
+tidy(). The integer floor is therefore a choice of default target rather
+than a correction applied behind the caller's back. It is the right default
+because a count feature has no mass strictly between its levels: a window
+narrower than one unit has an empty interior, the finite difference of a
+piecewise constant learner over it is zero except where the window straddles
+a split, and dividing that by 2h inflates the rare nonzero case without
+bound. At h = 0.5 the window is exactly the one-unit contrast, which is the
+interpretable quantity for a count.
+
+Pass h explicitly to override the default entirely; the floor applies only
+to 'adaptive'.
 """
 
 import numpy as np
@@ -59,11 +69,48 @@ from typing import Callable, Optional, Union
 # Step size
 # ---------------------------------------------------------------------------
 
+def is_integer_valued(x: np.ndarray) -> bool:
+    """
+    Whether a feature takes only integer values at more than one level.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        A single feature column, shape (n_obs,).
+
+    Returns
+    -------
+    bool
+    """
+    finite = x[np.isfinite(x)]
+    if finite.size == 0:
+        return False
+    unique = np.unique(finite)
+    return len(unique) > 1 and bool(np.all(unique == np.rint(unique)))
+
+
 def compute_adaptive_h(X: np.ndarray) -> np.ndarray:
     """
     Compute per-feature adaptive step sizes.
 
         h_j = max(1e-4, 0.05 * std(X[:, j]))
+
+    with an additional floor of 0.5 for integer-valued features:
+
+        h_j = max(h_j, 0.5)   if X[:, j] takes only integer values
+
+    The floor is about the estimand, not about numerical accuracy. A count
+    feature -- bedrooms, years of education, months delayed -- has no mass
+    strictly between its levels, so a window narrower than one unit contains
+    no observations in its interior. For a piecewise constant learner the
+    finite difference over such a window is zero except where the window
+    happens to straddle a split, and dividing that by 2h inflates the rare
+    nonzero case without bound. Flooring h at 0.5 makes the window exactly
+    the one-unit contrast, which is also the interpretable quantity for a
+    count.
+
+    Features declared categorical never reach this function: they use the
+    level contrast in categorical_ame instead, for which h is undefined.
 
     Parameters
     ----------
@@ -76,7 +123,13 @@ def compute_adaptive_h(X: np.ndarray) -> np.ndarray:
         Per-feature step sizes, shape (n_features,).
     """
     stds = np.std(X, axis=0)
-    return np.maximum(1e-4, 0.05 * stds)
+    h = np.maximum(1e-4, 0.05 * stds)
+
+    for j in range(X.shape[1]):
+        if is_integer_valued(X[:, j]):
+            h[j] = max(h[j], 0.5)
+
+    return h
 
 
 def resolve_h(X: np.ndarray, h: Union[float, str, np.ndarray]) -> np.ndarray:

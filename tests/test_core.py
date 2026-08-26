@@ -28,6 +28,7 @@ import pytest
 from marginfx.core import (
     MarginfxResult,
     compute_adaptive_h,
+    is_integer_valued,
     contrast,
     plugin_ame,
     plugin_ames,
@@ -86,20 +87,58 @@ class TestAdaptiveH:
         h = compute_adaptive_h(X)
         assert h[0] == pytest.approx(1e-4)
 
-    def test_no_integer_floor(self, rng):
+    def test_integer_floor_applies(self, rng):
         """
-        An earlier version raised h to 0.5 for integer-valued features so that
-        differences would cross tree split thresholds. Under the window
-        estimand h defines the target, so that floor silently changed what was
-        being estimated. It must not come back.
+        A count feature has no mass between its levels, so the default window
+        is widened to the one-unit contrast.
         """
         X = np.column_stack([
-            rng.integers(1, 17, size=500).astype(float),
+            rng.integers(0, 4, size=500).astype(float),
             rng.standard_normal(500),
         ])
+        assert 0.05 * X[:, 0].std() < 0.5
         h = compute_adaptive_h(X)
+        assert h[0] == pytest.approx(0.5)
+
+    def test_integer_floor_never_lowers_h(self, rng):
+        """The floor is a floor: a wide-ranging count keeps 0.05 * std."""
+        X = rng.integers(0, 200, size=(500, 1)).astype(float)
+        h = compute_adaptive_h(X)
+        assert h[0] > 0.5
         assert h[0] == pytest.approx(0.05 * X[:, 0].std())
+
+    def test_no_floor_for_continuous_feature(self, rng):
+        """A continuous feature with small spread is left alone."""
+        X = (rng.standard_normal((500, 1)) * 0.3)
+        h = compute_adaptive_h(X)
         assert h[0] < 0.5
+        assert h[0] == pytest.approx(0.05 * X[:, 0].std())
+
+    def test_explicit_h_bypasses_the_floor(self, rng):
+        """The floor is part of 'adaptive' only; an explicit h is the caller's."""
+        X = rng.integers(0, 4, size=(500, 2)).astype(float)
+        np.testing.assert_allclose(resolve_h(X, 0.01), np.full(2, 0.01))
+        np.testing.assert_allclose(resolve_h(X, np.array([0.02, 0.3])), [0.02, 0.3])
+
+
+class TestIsIntegerValued:
+
+    def test_detects_counts(self):
+        assert is_integer_valued(np.array([0.0, 1.0, 2.0, 3.0]))
+
+    def test_rejects_continuous(self):
+        assert not is_integer_valued(np.array([0.0, 1.5, 2.0]))
+
+    def test_rejects_constant(self):
+        """One level is not a count feature; it falls to the 1e-4 floor."""
+        assert not is_integer_valued(np.full(10, 3.0))
+
+    def test_handles_negative_integers(self):
+        assert is_integer_valued(np.array([-2.0, -1.0, 0.0, 1.0]))
+
+    def test_ignores_non_finite(self):
+        assert is_integer_valued(np.array([1.0, 2.0, np.nan]))
+        assert not is_integer_valued(np.array([np.nan, np.nan]))
 
     def test_resolve_scalar(self, X_linear):
         h = resolve_h(X_linear, 0.01)

@@ -286,6 +286,62 @@ class TestInference:
 # Mechanics
 # ---------------------------------------------------------------------------
 
+class TestCountFeatures:
+    """
+    The integer floor on adaptive h exists for this case: a piecewise
+    constant learner differenced over a sub-unit window on a count feature.
+    """
+
+    @pytest.fixture
+    def count_data(self, rng):
+        n = 3000
+        beds = rng.integers(1, 6, size=n).astype(float)
+        area = rng.standard_normal(n) * 500 + 1500
+        X = np.column_stack([area, beds])
+        y = 100.0 * area - 20000.0 * beds + rng.standard_normal(n) * 10000
+        return X, y
+
+    def test_adaptive_h_widens_to_one_unit(self, count_data):
+        X, y = count_data
+        res = mfx.fit(RandomForestRegressor(n_estimators=50, max_depth=6,
+                                            random_state=0),
+                      X, y, feature_names=['area', 'beds'], n_folds=3,
+                      seed=0, verbose=False)
+        assert res.h['beds'] == pytest.approx(0.5)
+        assert res.h['area'] == pytest.approx(0.05 * X[:, 0].std())
+
+    def test_sub_unit_window_loses_the_effect(self, count_data):
+        """
+        Over a window narrower than the gap between levels the learner is
+        constant almost everywhere, so the difference carries no signal: the
+        estimate collapses toward zero. Widening to the one-unit contrast
+        recovers the true -20000 to within a factor of two.
+        """
+        X, y = count_data
+        learner = RandomForestRegressor(n_estimators=100, max_depth=8,
+                                        random_state=0)
+        floored = mfx.fit(learner, X, y, feature_names=['area', 'beds'],
+                          n_folds=3, seed=0, verbose=False)
+        narrow = mfx.fit(learner, X, y, feature_names=['area', 'beds'],
+                         h=np.array([0.05 * X[:, 0].std(),
+                                     0.05 * X[:, 1].std()]),
+                         n_folds=3, seed=0, verbose=False)
+
+        assert -40000.0 < floored.estimates['beds'] < -10000.0
+        assert abs(narrow.estimates['beds']) < 0.1 * abs(
+            floored.estimates['beds']
+        )
+
+    def test_continuous_feature_is_unaffected(self, count_data):
+        """The floor touches counts only; area keeps its 0.05 * std window."""
+        X, y = count_data
+        res = mfx.fit(RandomForestRegressor(n_estimators=100, max_depth=8,
+                                            random_state=0),
+                      X, y, feature_names=['area', 'beds'], n_folds=3,
+                      seed=0, verbose=False)
+        assert 50.0 < res.estimates['area'] < 150.0
+
+
 class TestMechanics:
 
     def test_every_observation_is_scored(self, linear_data):
