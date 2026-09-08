@@ -1,7 +1,14 @@
 """
 bootstrap.py
 ------------
-Refitting bootstrap -- retained as a DIAGNOSTIC, not as an inference procedure.
+Refitting bootstrap for the plug-in window AMEs.
+
+Consistent for the variability of the plug-in average around its own
+expectation under the learner, and blind to the distance between that
+expectation and the true window effect. Valid where the learner's
+regularization bias is small relative to the standard error; silently
+invalid where it is not, increasingly so as n grows. See fit() for the
+debiased estimator, which removes that term instead of assuming it away.
 
 What this measures
 ------------------

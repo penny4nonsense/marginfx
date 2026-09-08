@@ -37,9 +37,12 @@ influence function -- no resampling, K model fits in total. The correction term
 removes the first-order bias that regularization of the learner transmits to
 the plug-in average. See dml.py.
 
-`bootstrap_diagnostic` retains the older refitting bootstrap, but only as a
-diagnostic for model instability. Its standard errors are not valid for
-inference; see bootstrap.py for why.
+`bootstrap_diagnostic` retains the older refitting bootstrap. Its standard
+errors are consistent for the variability of the plug-in average around its own
+expectation under the learner, but blind to the gap between that expectation
+and the true window effect -- so they are valid where the learner's
+regularization bias is small relative to the standard error, and silently
+invalid where it is not. See bootstrap.py.
 
 Supported learners
 ------------------
@@ -206,6 +209,13 @@ def fit(
     trim : bool
         Apply the trimming weight. Default True. Set False only when the
         covariate support is unbounded, e.g. Gaussian simulation designs.
+    bounds : tuple of np.ndarray, optional
+        (lower, upper) support bounds for the trimming weight. Defaults to the
+        sample extremes. Pass the true support when it is known -- in a
+        simulation, say -- so the estimand does not drift with the sample: the
+        sample minimum of a bounded covariate sits strictly inside its support
+        and moves with n, which would make theta_h a different target at every
+        sample size.
     n_folds : int
         Cross-fitting folds K. Default 5.
     riesz : None, dict, or Callable
@@ -298,12 +308,28 @@ def bootstrap_diagnostic(
     loss_fn=None,
 ) -> MarginfxResult:
     """
-    Refitting-bootstrap dispersion of the plug-in window AMEs -- a DIAGNOSTIC.
+    Refitting-bootstrap standard errors for the plug-in window AMEs.
 
-    The standard errors returned here are not valid for inference. They are
-    blind to the learner's regularization bias, which is exactly the term the
-    debiased estimator in `fit` is built to remove. Use this to detect model
-    instability, and `fit` to do inference.
+    These standard errors are consistent for the variability of the plug-in
+    average around its own expectation under the learner. What they cannot see
+    is the distance between that expectation and the true window effect: the
+    learner's regularization bias, which resampling leaves untouched because
+    every replicate recentres at a similarly regularized fit.
+
+    They are therefore valid where that bias is small relative to the standard
+    error, and they fail without warning where it is not. The failure is not
+    hypothetical and it is not confined to small samples -- it gets worse as n
+    grows, because the interval shrinks while the bias does not. In simulation
+    on a linear design, a depth-capped random forest covers at 0.99 at n=250
+    and at 0.80 at n=5000, with the bias rising from 0.2 to 2.1 standard errors
+    over that range; a correctly specified logistic regression covers at
+    roughly the nominal rate throughout.
+
+    Use this when the plug-in average is the quantity you want -- to compare
+    fitted surfaces, or to measure how far a learner moves under resampling --
+    and `fit` when you want inference on the window effect itself. `fit`
+    removes the bias term rather than assuming it away, and needs no
+    resampling.
 
     Unlike `fit`, this takes an ALREADY FITTED model, and refits it on each
     replicate warm-started from that fit.
@@ -346,7 +372,8 @@ def bootstrap_diagnostic(
     engine_name = _detect_engine(model)
     if verbose:
         print(f"marginfx: detected {engine_name} model")
-        print(f"marginfx: {n_bootstrap} bootstrap replicates (DIAGNOSTIC ONLY)")
+        print(f"marginfx: {n_bootstrap} bootstrap replicates "
+              f"(plug-in; blind to regularization bias)")
 
     predict_fn, fit_fn = _load_engine(
         model,
