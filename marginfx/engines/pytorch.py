@@ -116,8 +116,27 @@ def _squeeze_output_tensor(output):
     return output
 
 
+def _reset_parameters(module) -> None:
+    """
+    Re-initialize every learnable parameter in a module tree, in place.
+
+    Walks the submodules and calls reset_parameters() wherever torch defines
+    it, which covers Linear, Conv*, BatchNorm and the recurrent layers.
+    Modules without it hold no learnable state of their own and are skipped.
+
+    Parameters
+    ----------
+    module : torch.nn.Module
+        Modified in place.
+    """
+    for sub in module.modules():
+        reset = getattr(sub, 'reset_parameters', None)
+        if callable(reset):
+            reset()
+
+
 # ---------------------------------------------------------------------------
-# Warm-start fit function
+# Cold refit function
 # ---------------------------------------------------------------------------
 
 def make_fit_fn(
@@ -164,8 +183,12 @@ def make_fit_fn(
         loss_fn = torch.nn.BCELoss()
 
     def fit_fn(current_model, X_boot: np.ndarray, y_boot: np.ndarray):
-        # Deep copy preserves all weights as warm-start initialization
+        # The architecture is reused; the fitted weights are not. Restarting
+        # from the full-sample weights would carry that fit into every
+        # replicate and understate how far the fitted function moves with the
+        # data, which is the quantity the diagnostic is trying to measure.
         new_model = copy.deepcopy(current_model)
+        _reset_parameters(new_model)
         new_model.train()
 
         # Fresh optimizer instance for this replicate

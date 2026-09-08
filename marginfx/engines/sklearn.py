@@ -6,10 +6,9 @@ Sklearn engine for marginfx.
 Provides fit_fn and predict_fn for any scikit-learn compatible model,
 including XGBoost, LightGBM, and CatBoost via their sklearn wrappers.
 
-Warm-start behavior:
-    - Models with warm_start attribute: warm-started automatically
-    - XGBoost sklearn wrapper: warm-started via xgb_model parameter
-    - All other models: refitted cold, silently
+Refit behavior:
+    - Every model is cloned and refitted from scratch on each resample.
+      See _cold_refit for why warm-starting is wrong here.
 
 Prediction behavior:
     - Models with predict_proba: uses predict_proba[:, 1] (binary classification)
@@ -63,88 +62,51 @@ def make_predict_fn(model) -> Callable:
 # Fit function
 # ---------------------------------------------------------------------------
 
-def _is_xgboost(model) -> bool:
-    """Check if model is an XGBoost sklearn wrapper."""
-    try:
-        import xgboost as xgb
-        return isinstance(model, (xgb.XGBClassifier, xgb.XGBRegressor))
-    except ImportError:
-        return False
-
-
-def _is_lightgbm(model) -> bool:
-    """Check if model is a LightGBM sklearn wrapper."""
-    try:
-        import lightgbm as lgb
-        return isinstance(model, (lgb.LGBMClassifier, lgb.LGBMRegressor))
-    except ImportError:
-        return False
-
-
-def _warm_start_refit(model, X_boot: np.ndarray, y_boot: np.ndarray):
+def _cold_refit(model, X_boot: np.ndarray, y_boot: np.ndarray):
     """
-    Refit a model with warm-start if supported, otherwise refit cold.
+    Refit a fresh copy of the model on a bootstrap resample.
 
-    Warm-start support:
-        - sklearn models with warm_start attribute
-        - XGBoost via xgb_model parameter
-        - LightGBM via init_model parameter
+    The refit is deliberately cold. An earlier version warm-started from the
+    original fit wherever the library allowed it, which is wrong for a
+    resampling diagnostic in two ways. It carries the full-sample fit into
+    every replicate, so the spread understates how much the fitted function
+    actually moves with the data. And for scikit-learn forests it did nothing
+    at all: setting warm_start=True and refitting with n_estimators unchanged
+    grows no new trees, so every replicate returned bit-identical predictions
+    and the reported dispersion was exactly zero. XGBoost was worse than
+    useless rather than inert -- passing the original booster appended another
+    round of trees to it, so each replicate held a strictly larger model than
+    the one being diagnosed.
+
+    Cloning discards the fitted state and keeps the hyperparameters, which is
+    what "refit on the resample" means.
 
     Parameters
     ----------
-    model : fitted model
-        Original fitted model used as warm-start initialization.
+    model : object
+        The originally fitted model. Not mutated.
     X_boot : np.ndarray
-        Bootstrap sample features.
+        Resampled features.
     y_boot : np.ndarray
-        Bootstrap sample targets.
+        Resampled targets.
 
     Returns
     -------
-    fitted model
-        New model fitted on bootstrap sample.
+    object
+        A model of the same configuration, fitted from scratch on the
+        resample.
     """
+    from ..learner import clone_estimator
 
-    # --- XGBoost warm-start ---
-    if _is_xgboost(model):
-        new_model = copy.copy(model)
-        # XGBoost warm-starts via xgb_model parameter in fit()
-        new_model.fit(
-            X_boot,
-            y_boot,
-            xgb_model=model.get_booster(),
-        )
-        return new_model
-
-    # --- LightGBM warm-start ---
-    if _is_lightgbm(model):
-        new_model = copy.copy(model)
-        new_model.fit(
-            X_boot,
-            y_boot,
-            init_model=model.booster_,
-        )
-        return new_model
-
-    # --- Sklearn warm_start attribute ---
-    if hasattr(model, 'warm_start'):
-        new_model = copy.deepcopy(model)
-        new_model.warm_start = True
-        new_model.fit(X_boot, y_boot)
-        return new_model
-
-    # --- Cold refit fallback ---
-    new_model = copy.deepcopy(model)
-    new_model.fit(X_boot, y_boot)
-    return new_model
-
-
+    fresh = clone_estimator(model)
+    fresh.fit(X_boot, y_boot)
+    return fresh
 def make_fit_fn(model) -> Callable:
     """
     Build a fit_fn for a fitted sklearn-compatible model.
 
-    The returned fit_fn warm-starts from the original model where possible,
-    falling back to cold refit silently for unsupported models.
+    The returned fit_fn clones the model and refits it from scratch on each
+    resample.
 
     Parameters
     ----------
@@ -157,7 +119,7 @@ def make_fit_fn(model) -> Callable:
         fit_fn(model, X_boot, y_boot) -> fitted_model
     """
     def fit_fn(current_model, X_boot, y_boot):
-        return _warm_start_refit(current_model, X_boot, y_boot)
+        return _cold_refit(current_model, X_boot, y_boot)
 
     return fit_fn
 
@@ -186,7 +148,7 @@ def get_engine(model) -> Tuple[Callable, Callable]:
             Returns predictions for input X.
 
         fit_fn(model, X_boot, y_boot) -> fitted_model
-            Refits model on bootstrap sample, warm-starting where possible.
+            Refits a fresh clone of the model on the bootstrap sample.
 
     Examples
     --------

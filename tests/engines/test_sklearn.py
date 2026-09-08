@@ -151,25 +151,59 @@ class TestPredictFn:
 
 class TestFitFn:
 
-    def test_warm_start_fires_for_random_forest(
+    def test_refit_changes_a_random_forest(
         self, fitted_rf_classifier, classification_data
     ):
-        """RandomForest has warm_start — fit_fn should use it."""
+        """
+        The refit must actually move the forest.
+
+        This is a regression test. The engine used to set warm_start=True and
+        refit, which for a forest with n_estimators unchanged grows no new
+        trees and returns bit-identical predictions -- so the bootstrap it
+        fed reported a dispersion of exactly zero.
+        """
         model, X, y = fitted_rf_classifier
         fit_fn = make_fit_fn(model)
 
-        # Resample
-        idx = np.random.default_rng(42).integers(0, X.shape[0], size=X.shape[0])
-        X_boot, y_boot = X[idx], y[idx]
+        base = model.predict_proba(X)[:, 1]
+        rng = np.random.default_rng(42)
 
-        new_model = fit_fn(model, X_boot, y_boot)
+        moved = False
+        for _ in range(3):
+            idx = rng.integers(0, X.shape[0], size=X.shape[0])
+            new_model = fit_fn(model, X[idx], y[idx])
 
-        # New model should be able to predict
-        assert hasattr(new_model, 'predict')
-        assert new_model.predict(X).shape == (X.shape[0],)
+            assert hasattr(new_model, 'predict')
+            assert new_model.predict(X).shape == (X.shape[0],)
+            assert len(new_model.estimators_) == len(model.estimators_)
+
+            if np.abs(new_model.predict_proba(X)[:, 1] - base).max() > 1e-12:
+                moved = True
+
+        assert moved, "refit left the forest's predictions unchanged"
+
+    def test_refit_does_not_grow_a_boosted_model(self, classification_data):
+        """
+        The refit must not append to the original booster.
+
+        XGBoost used to be warm-started by passing the fitted booster to
+        fit(), so each replicate carried strictly more trees than the model
+        being diagnosed.
+        """
+        xgb = pytest.importorskip('xgboost')
+        X, y = classification_data
+        model = xgb.XGBClassifier(
+            n_estimators=10, max_depth=2, verbosity=0, eval_metric='logloss'
+        ).fit(X, y)
+        fit_fn = make_fit_fn(model)
+
+        idx = np.random.default_rng(0).integers(0, X.shape[0], size=X.shape[0])
+        new_model = fit_fn(model, X[idx], y[idx])
+
+        assert new_model.get_booster().num_boosted_rounds() ==             model.get_booster().num_boosted_rounds()
 
     def test_cold_refit_for_svc(self, fitted_svc, classification_data):
-        """SVC has no warm_start — fit_fn should refit cold silently."""
+        """SVC refits cold like everything else, without warning."""
         model, X, y = fitted_svc
         fit_fn = make_fit_fn(model)
 

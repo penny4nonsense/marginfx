@@ -193,28 +193,33 @@ class TestFitFn:
             assert np.allclose(orig, current.numpy()), \
                 "fit_fn mutated original model weights"
 
-    def test_warm_start_initializes_from_original(self, binary_classifier):
+    def test_refit_does_not_resume_from_original_weights(self, binary_classifier):
         """
-        New model should start from original weights.
-        With n_epochs=1 and small lr, weights should be close to original.
+        The replicate must train from a fresh initialization.
+
+        Resuming from the full-sample weights carries that fit into every
+        replicate, so the bootstrap measures how far one epoch moves an
+        already-converged network rather than how far the fitted function
+        moves with the data.
         """
         model, X, y = binary_classifier
         original_weights = [w.numpy().copy() for w in model.weights]
 
-        # Use very small learning rate so weights barely move
         fit_fn = make_fit_fn(model, n_epochs=1, batch_size=200)
         idx = np.random.default_rng(42).integers(0, X.shape[0], size=X.shape[0])
-        X_boot, y_boot = X[idx], y[idx]
-        new_model = fit_fn(model, X_boot, y_boot)
+        new_model = fit_fn(model, X[idx], y[idx])
 
         new_weights = [w.numpy() for w in new_model.weights]
 
-        # Weights should be initialized from original (not random)
-        # Check that at least some weights are close to original
-        max_diffs = [np.abs(o - n).max() for o, n in zip(original_weights, new_weights)]
-        # Should be much closer than random init would be
-        assert all(d < 10.0 for d in max_diffs), \
-            "New model weights seem far from original — warm-start may have failed"
+        assert len(new_weights) == len(original_weights)
+        for o, n in zip(original_weights, new_weights):
+            assert o.shape == n.shape
+
+        # A single epoch cannot travel far, so weights still essentially equal
+        # to the original ones mean the refit resumed instead of restarting.
+        moved = max(np.abs(o - n).max()
+                    for o, n in zip(original_weights, new_weights))
+        assert moved > 1e-6, "refit appears to have resumed from the original weights"
 
     def test_n_epochs_parameter(self, binary_classifier):
         """fit_fn should accept and use n_epochs parameter."""

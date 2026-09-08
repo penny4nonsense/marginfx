@@ -102,15 +102,16 @@ def make_fit_fn(
         import gc
         import tensorflow as tf
 
-        # Get current weights for warm-start
+        # Architecture and training settings are reused; the fitted weights
+        # are not. Restarting from the full-sample weights would carry that
+        # fit into every replicate and understate how far the fitted function
+        # moves with the data, which is the whole quantity being measured.
         try:
-            weights = current_model.get_weights()
             lr = float(current_model.optimizer.learning_rate.numpy())
             config = current_model.get_config()
             loss = current_model.loss
         except Exception:
             # Fall back to original model settings if current_model is unavailable
-            weights = original_weights
             lr = original_lr
             config = original_config
             loss = original_loss
@@ -119,13 +120,12 @@ def make_fit_fn(
         tf.keras.backend.clear_session()
         tf.keras.utils.disable_interactive_logging()
 
-        # Rebuild from config with warm-start weights
+        # Rebuild from config with freshly initialized weights
         new_model = tf.keras.Sequential.from_config(config)
         new_model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
             loss=loss,
         )
-        new_model.set_weights(weights)
 
         X_tensor = tf.cast(tf.constant(X_boot), dtype=tf.float32)
         y_tensor = tf.cast(tf.constant(y_boot), dtype=tf.float32)
