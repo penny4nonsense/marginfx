@@ -191,6 +191,7 @@ def crossfit_ames(
     categorical_features: Optional[list] = None,
     h: Union[float, str, np.ndarray] = 'adaptive',
     trim: bool = True,
+    bounds: Optional[tuple] = None,
     n_folds: int = 5,
     riesz=None,
     sieve_degree: int = 2,
@@ -287,7 +288,7 @@ def crossfit_ames(
     # sample, then hold fixed. Letting either drift with the fold would mean
     # each fold targets a slightly different functional.
     h_values = resolve_h(X, h)
-    bounds = support_bounds(X)
+    bounds = support_bounds(X) if bounds is None else bounds
 
     W = np.ones((n, d), dtype=float)
     if trim:

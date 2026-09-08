@@ -270,6 +270,67 @@ def gaussian_window_riesz(feature_idx: int, h: float) -> KnownRiesz:
     return KnownRiesz(fn)
 
 
+def uniform_window_riesz(
+    feature_idx: int,
+    h: float,
+    lower: float,
+    upper: float,
+) -> KnownRiesz:
+    """
+    Closed-form representer for independent uniform covariates on a box.
+
+    With X_j ~ U(lower, upper) the density is constant in the j direction, so
+    it cancels from the representer entirely and only the trimming weight
+    survives. Writing w(u) = 1{lower + h <= u_j <= upper - h} for the hard
+    indicator of Omega_{j,h}, and q = w p,
+
+        alpha_h(u) = ( q(u - h e_j) - q(u + h e_j) ) / ( 2h p(u) )
+                   = ( w(u - h e_j) - w(u + h e_j) ) / ( 2h )
+                   = ( 1{u_j >= lower + 2h} - 1{u_j <= upper - 2h} ) / ( 2h )
+
+    so alpha_h is the step function taking -1/(2h) on the lower shell
+    [lower, lower + 2h), zero on the interior, and +1/(2h) on the upper shell
+    (upper - 2h, upper]. It is bounded by 1/(2h), and integrates to zero
+    because the two shells have equal probability.
+
+    This is the bounded-support counterpart to gaussian_window_riesz. There the
+    density is unbounded below and the representer is unbounded; here both are
+    finite, so the design satisfies the density-bounded assumptions directly.
+    Trimming is active rather than vacuous, so pass trim=True and supply the
+    same bounds used here, or the weight in the score will not match the weight
+    assumed by this representer.
+
+    Parameters
+    ----------
+    feature_idx : int
+        Coordinate j.
+    h : float
+        Step size.
+    lower, upper : float
+        Support endpoints for coordinate j. Pass the true endpoints of the
+        design rather than the sample minimum and maximum, so that the estimand
+        does not drift with the sample.
+
+    Returns
+    -------
+    KnownRiesz
+    """
+    if not upper - lower > 4.0 * h:
+        raise ValueError(
+            f'window too wide for the support: need upper - lower > 4h, '
+            f'got {upper - lower} <= {4.0 * h}. The two trimming shells would '
+            f'overlap and the representer would not be well defined.'
+        )
+
+    def fn(X: np.ndarray) -> np.ndarray:
+        xj = X[:, feature_idx]
+        hi = (xj >= lower + 2.0 * h).astype(float)
+        lo = (xj <= upper - 2.0 * h).astype(float)
+        return (hi - lo) / (2.0 * h)
+
+    return KnownRiesz(fn)
+
+
 # ---------------------------------------------------------------------------
 # Propensity representer for binary features
 # ---------------------------------------------------------------------------

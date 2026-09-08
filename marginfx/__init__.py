@@ -63,6 +63,7 @@ from .riesz import (
     PropensityRiesz,
     SieveRiesz,
     gaussian_window_riesz,
+    uniform_window_riesz,
 )
 
 
@@ -165,6 +166,7 @@ def fit(
     categorical_features: Optional[list] = None,
     h: Union[float, str, np.ndarray] = 'adaptive',
     trim: bool = True,
+    bounds: Optional[tuple] = None,
     n_folds: int = 5,
     riesz=None,
     sieve_degree: int = 2,
@@ -261,6 +263,7 @@ def fit(
         categorical_features=categorical_features,
         h=h,
         trim=trim,
+        bounds=bounds,
         n_folds=n_folds,
         riesz=riesz,
         sieve_degree=sieve_degree,
@@ -385,6 +388,7 @@ __all__ = [
     'KnownRiesz',
     'PropensityRiesz',
     'gaussian_window_riesz',
+    'uniform_window_riesz',
 ]
 
 __version__ = '0.3.0'
